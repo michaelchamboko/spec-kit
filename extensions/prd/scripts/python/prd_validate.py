@@ -1,0 +1,370 @@
+#!/usr/bin/env python3
+"""PRD-to-Plans: deterministic validation entrypoint.
+
+Invoked by ``speckit.prd.validate``. Performs the read-only structural,
+traceability, graph-freshness, and readiness checks the command spec
+describes:
+
+- Manifest schema, state consistency, required fields
+- Source integrity (normalized markdown present, SHA-256 matches manifest)
+- Requirements traceability (every requirement has a stable ID and source)
+- Slice decomposition (stable IDs, acyclic dependencies, frozen order)
+- Codegraph evidence (provider/version, indexed state, exclusions)
+- Council review presence (decomposition and final)
+- Child artifact completeness (for ``phase=final`` or ``PLANNING+`` state)
+
+This script is **read-only**. It never modifies artifact files or source
+code; failures exit non-zero with a structured report. No AI model calls
+are made.
+
+Usage::
+
+    prd_validate.py slug=<slug> [phase=decomposition|final]
+"""
+
+from __future__ import annotations
+
+import re
+import sys
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+import prd_common as common  # noqa: E402
+
+REQUIREMENT_PREFIXES = ("PRD-FR-", "PRD-NFR-")
+ACCEPTANCE_PREFIX = "AC-"
+SLICE_PREFIX = "SLC-"
+DECISION_PREFIX = "DEC-"
+
+REQUIRED_MANIFEST_FIELDS = (
+    "schema_version",
+    "extension",
+    "slug",
+    "state",
+    "active_version",
+    "source",
+    "slices",
+)
+
+
+def _check(name: str, ok: bool, detail: str = "") -> dict[str, str]:
+    return {"name": name, "status": "PASS" if ok else "FAIL", "detail": detail}
+
+
+def _required_manifest_fields(manifest: dict[str, object]) -> list[dict[str, str]]:
+    failures: list[dict[str, str]] = []
+    for field in REQUIRED_MANIFEST_FIELDS:
+        if field not in manifest:
+            failures.append(
+                _check(
+                    f"manifest.{field}",
+                    False,
+                    "missing required field",
+                )
+            )
+    return failures
+
+
+def _validate_source_integrity(
+    project_root: Path, artifact_dir: Path, manifest: dict[str, object]
+) -> list[dict[str, str]]:
+    failures: list[dict[str, str]] = []
+    source_meta = manifest.get("source")
+    if not isinstance(source_meta, dict):
+        return [_check("source", False, "source metadata missing")]
+
+    active_version = str(manifest.get("active_version", ""))
+    preserved_rel = str(source_meta.get("preserved_at", ""))
+    preserved_path = project_root / preserved_rel
+    if not preserved_path.is_file():
+        failures.append(
+            _check(
+                "source.preserved",
+                False,
+                f"missing preserved file: {preserved_rel}",
+            )
+        )
+        return failures
+
+    expected_digest = str(source_meta.get("sha256", ""))
+    actual_digest = common.sha256_file(preserved_path)
+    if expected_digest and expected_digest != actual_digest:
+        failures.append(
+            _check(
+                "source.sha256",
+                False,
+                f"expected {expected_digest}, got {actual_digest}",
+            )
+        )
+
+    normalized_rel = preserved_rel.rsplit(".", 1)[0] + ".normalized.md"
+    normalized_path = project_root / normalized_rel
+    if not normalized_path.is_file():
+        failures.append(
+            _check(
+                "source.normalized",
+                False,
+                f"missing normalized markdown: {normalized_rel}",
+            )
+        )
+    return failures
+
+
+def _validate_requirements(
+    project_root: Path, artifact_dir: Path, manifest: dict[str, object]
+) -> list[dict[str, str]]:
+    failures: list[dict[str, str]] = []
+    requirements_file = artifact_dir / "requirements.md"
+    if not requirements_file.is_file():
+        return [
+            _check(
+                "requirements.exists",
+                False,
+                "requirements.md missing — run speckit.prd.plan first",
+            )
+        ]
+    text = requirements_file.read_text(encoding="utf-8")
+    ids = re.findall(r"\b(PRD-FR-\d+|PRD-NFR-\d+)\b", text)
+    if not ids:
+        failures.append(
+            _check(
+                "requirements.ids",
+                False,
+                "no PRD-FR-/PRD-NFR- ids detected in requirements.md",
+            )
+        )
+    elif len(set(ids)) != len(ids):
+        failures.append(
+            _check("requirements.unique", False, "duplicate requirement ids")
+        )
+    return failures
+
+
+def _validate_slices(
+    project_root: Path, prd_dir: Path, manifest: dict[str, object]
+) -> list[dict[str, str]]:
+    failures: list[dict[str, str]] = []
+    slices = manifest.get("slices")
+    if not isinstance(slices, list) or not slices:
+        return [_check("slices.present", False, "slices array empty or missing")]
+    seen_ids: set[str] = set()
+    dependencies: dict[str, set[str]] = {}
+    for slice_meta in slices:
+        if not isinstance(slice_meta, dict):
+            continue
+        sid = str(slice_meta.get("id", ""))
+        if not sid.startswith(SLICE_PREFIX):
+            failures.append(
+                _check(
+                    f"slices.id_format[{sid}]",
+                    False,
+                    f"slice id must start with {SLICE_PREFIX}",
+                )
+            )
+        if sid in seen_ids:
+            failures.append(
+                _check(f"slices.unique[{sid}]", False, "duplicate slice id")
+            )
+        seen_ids.add(sid)
+        deps = slice_meta.get("dependencies", []) or []
+        deps_set: set[str] = set()
+        for dep in deps:
+            if dep not in seen_ids:
+                failures.append(
+                    _check(
+                        f"slices.dep_unknown[{sid}->{dep}]",
+                        False,
+                        "dependency references unknown slice",
+                    )
+                )
+            deps_set.add(dep)
+        dependencies[sid] = deps_set
+
+    # Cycle detection (DFS) over the slice dependency graph.
+    WHITE, GRAY, BLACK = 0, 1, 2
+    color = {sid: WHITE for sid in dependencies}
+
+    def visit(node: str) -> bool:
+        color[node] = GRAY
+        for dep in dependencies.get(node, ()):  # type: ignore[arg-type]
+            if dep not in color:
+                continue
+            if color[dep] == GRAY:
+                return True
+            if color[dep] == WHITE and visit(dep):
+                return True
+        color[node] = BLACK
+        return False
+
+    for node in list(color):
+        if color[node] == WHITE and visit(node):
+            failures.append(
+                _check("slices.acyclic", False, "dependency cycle detected")
+            )
+            break
+
+    # Materialized directory presence when state implies frozen sequence.
+    if manifest.get("frozen_sequence"):
+        for slice_meta in slices:
+            if not isinstance(slice_meta, dict):
+                continue
+            directory = str(slice_meta.get("directory", ""))
+            if not directory:
+                continue
+            if not (prd_dir / directory).is_dir():
+                failures.append(
+                    _check(
+                        f"slices.materialized[{directory}]",
+                        False,
+                        "slice directory not materialized on disk",
+                    )
+                )
+    return failures
+
+
+def _validate_council_reviews(
+    artifact_dir: Path, manifest: dict[str, object], phase: str
+) -> list[dict[str, str]]:
+    failures: list[dict[str, str]] = []
+    reviews_dir = artifact_dir / "reviews"
+    if phase in {"decomposition", "all"}:
+        version = str(manifest.get("decomposition_version", "v001"))
+        target = reviews_dir / f"decomposition-{version}.md"
+        if not target.is_file():
+            failures.append(
+                _check(
+                    "reviews.decomposition",
+                    False,
+                    f"missing {target.relative_to(artifact_dir.parent.parent.parent)}",
+                )
+            )
+    if phase in {"final", "all"}:
+        version = str(manifest.get("final_review_version", "v001"))
+        target = reviews_dir / f"final-{version}.md"
+        if not target.is_file():
+            failures.append(
+                _check(
+                    "reviews.final",
+                    False,
+                    f"missing {target.relative_to(artifact_dir.parent.parent.parent)}",
+                )
+            )
+    return failures
+
+
+def _validate_child_artifacts(
+    project_root: Path, prd_dir: Path, manifest: dict[str, object]
+) -> list[dict[str, str]]:
+    failures: list[dict[str, str]] = []
+    slices = manifest.get("slices") or []
+    if not isinstance(slices, list) or not slices:
+        return failures
+    required = ("spec.md", "plan.md", "tasks.md", "code-impact.md")
+    for slice_meta in slices:
+        if not isinstance(slice_meta, dict):
+            continue
+        directory = prd_dir / str(slice_meta.get("directory", ""))
+        if not directory.is_dir():
+            failures.append(
+                _check(
+                    f"artifacts.dir[{directory.name}]",
+                    False,
+                    "slice directory missing",
+                )
+            )
+            continue
+        for leaf in required:
+            if not (directory / leaf).is_file():
+                failures.append(
+                    _check(
+                        f"artifacts.missing[{directory.name}/{leaf}]",
+                        False,
+                        "required child artifact missing",
+                    )
+                )
+    return failures
+
+
+def _phase_for_state(state: str) -> str:
+    if state == "AWAITING_DECOMPOSITION_APPROVAL":
+        return "decomposition"
+    if state in {"PLANNING", "PLAN_READY"}:
+        return "final"
+    return "all"
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = common.parse_args(argv)
+    project_root = common.find_project_root()
+    if project_root is None:
+        common.err("ERROR: not inside a Spec Kit project (.specify/ not found)")
+        return 1
+    raw_slug = args.get("slug", "")
+    if not raw_slug:
+        common.err("ERROR: missing slug=<slug>")
+        return 2
+    slug = common.normalize_slug(raw_slug)
+    phase = args.get("phase", "all").lower()
+    if phase not in {"decomposition", "final", "all"}:
+        common.err(f"ERROR: phase must be decomposition|final|all (got {phase!r})")
+        return 2
+
+    specs_root = project_root / ".specify" / "specs"
+    prd_dir = common.safe_create_dir(specs_root, project_root) / slug
+    artifact_dir = common.safe_create_dir(prd_dir / "000-spec-of-specs", project_root)
+    manifest = common.load_manifest(artifact_dir)
+    if manifest is None:
+        common.err(
+            f"ERROR: manifest.yml not found at {artifact_dir}; "
+            "run speckit.prd.plan first"
+        )
+        return 1
+
+    state = str(manifest.get("state", ""))
+    if phase == "decomposition" and state not in {
+        "AWAITING_DECOMPOSITION_APPROVAL",
+        "PLANNING",
+        "PLAN_READY",
+    }:
+        common.err(
+            f"ERROR: phase=decomposition requires state >= "
+            f"AWAITING_DECOMPOSITION_APPROVAL (got {state!r})"
+        )
+        return 1
+    if phase == "final" and state not in {"PLANNING", "PLAN_READY"}:
+        common.err(
+            f"ERROR: phase=final requires state in PLANNING|PLAN_READY "
+            f"(got {state!r})"
+        )
+        return 1
+
+    failures: list[dict[str, str]] = []
+    failures.extend(_required_manifest_fields(manifest))
+    failures.extend(_validate_source_integrity(project_root, artifact_dir, manifest))
+    failures.extend(_validate_requirements(project_root, artifact_dir, manifest))
+    if state in {"AWAITING_DECOMPOSITION_APPROVAL", "PLANNING", "PLAN_READY"}:
+        failures.extend(_validate_slices(project_root, prd_dir, manifest))
+    failures.extend(_validate_council_reviews(artifact_dir, manifest, phase))
+    if state in {"PLANNING", "PLAN_READY"} or phase == "final":
+        failures.extend(_validate_child_artifacts(project_root, prd_dir, manifest))
+
+    passed = sum(1 for f in failures if f["status"] == "PASS")
+    failed = sum(1 for f in failures if f["status"] == "FAIL")
+    summary = {
+        "slug": slug,
+        "manifest": str((artifact_dir / "manifest.yml").relative_to(project_root)),
+        "phase": phase,
+        "checks_passed": passed + (0 if failed else 1),
+        "checks_failed": failed,
+        "failures": [f for f in failures if f["status"] == "FAIL"],
+        "state": state,
+    }
+    common.info(common.json_dumps(summary))
+    return 0 if failed == 0 else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,61 @@
+schema_version: "1.0"
+extension:
+  id: prd
+  name: "PRD-to-Plans Translation"
+  version: "1.0.0"
+  description: "Converts a PRD into a codebase-aware spec-of-specs, numbered vertical-slice specifications, and implementation-ready task packets using Spec Kit, BMAD, OpenSpec, Taskmaster, and v3.5 protocol methodologies."
+  author: "spec-kit-core"
+  repository: https://github.com/github/spec-kit
+  license: MIT
+  effect: "read-write"
+  category: "planning"
+
+requires:
+  speckit_version: ">=0.16.0"
+  tools:
+    - name: git
+      required: false
+    - name: python3
+      required: false
+
+provides:
+  commands:
+    - name: speckit.prd.plan
+      file: commands/speckit.prd.plan.md
+      description: "Creates or reconciles a PRD workspace; decomposes PRD into spec-of-specs and vertical slices; stops for approval before generating child artifacts"
+    - name: speckit.prd.validate
+      file: commands/speckit.prd.validate.md
+      description: "Re-runs deterministic structural, traceability, graph-freshness, and readiness checks without modifying source code"
+  config:
+    - name: "prd-config.yml"
+      template: "config-template.yml"
+      description: "PRD-to-Plans translation configuration"
+      required: false
+
+hooks: {}
+
+tags:
+  - "prd"
+  - "planning"
+  - "specification"
+  - "bmad"
+  - "openspec"
+  - "taskmaster"
+  - "v3.5-protocol"
+
+config:
+  defaults:
+    graph_provider: "gitnexus"
+    fallback_tracing: true
+    slug_max_length: 64
+    prd_version_prefix: "prd-v"
+    slice_prefix: "SLC-"
+    requirement_prefixes:
+      functional: "PRD-FR-"
+      non_functional: "PRD-NFR-"
+    decision_prefix: "DEC-"
+    acceptance_prefix: "AC-"
+    task_prefix: "T"
+    council_lenses: 5
+    approval_required: true
+    stale_threshold_days: 30

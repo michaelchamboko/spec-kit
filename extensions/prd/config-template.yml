@@ -1,0 +1,58 @@
+# PRD-to-Plans Extension Configuration
+# Copy this file to .specify/extensions/prd/prd-config.yml and customize
+
+# Graph provider for codebase analysis: "gitnexus" | "direct"
+# gitnexus: Uses GitNexus index (preferred for brownfield)
+# direct: Direct repository and dependency tracing (fallback)
+graph_provider: "gitnexus"
+
+# Enable fallback to direct tracing when GitNexus is unavailable
+fallback_tracing: true
+
+# Maximum length for PRD slug (used in directory names)
+slug_max_length: 64
+
+# PRD version filename prefix (e.g., prd-v001.md)
+prd_version_prefix: "prd-v"
+
+# Slice ID prefix (e.g., SLC-001)
+slice_prefix: "SLC-"
+
+# Requirement ID prefixes
+requirement_prefixes:
+  functional: "PRD-FR-"
+  non_functional: "PRD-NFR-"
+
+# Decision ID prefix (e.g., DEC-001)
+decision_prefix: "DEC-"
+
+# Acceptance criterion ID prefix (e.g., AC-SLC-001-001)
+acceptance_prefix: "AC-"
+
+# Task ID prefix (e.g., SLC-001-T001)
+task_prefix: "T"
+
+# Number of Council review lenses (fixed at 5 per v3.5 protocol)
+council_lenses: 5
+
+# Require mandatory decomposition approval before generating child artifacts
+approval_required: true
+
+# Days after which PLAN_READY artifacts are considered stale without evidence refresh
+stale_threshold_days: 30
+
+# Safe URL fetching for public PRD sources
+safe_fetch:
+  enabled: true
+  max_size_bytes: 10485760  # 10 MB
+  allowed_schemes:
+    - "https"
+  timeout_seconds: 30
+
+# Artifact paths (relative to specs/<prd-slug>/)
+artifact_paths:
+  spec_of_specs: "000-spec-of-specs"
+  slices_prefix: ""
+
+# Manifest version
+manifest_version: "1.0"

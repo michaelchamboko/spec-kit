@@ -62,6 +62,24 @@
         "workflow",
         "core"
       ]
+    },
+    "prd": {
+      "name": "PRD-to-Plans Translation",
+      "id": "prd",
+      "version": "1.0.0",
+      "description": "Decompose a PRD into a codebase-aware spec-of-specs and numbered vertical-slice specifications with implementation-ready task packets (BMAD, OpenSpec, Taskmaster, v3.5 Council protocol)",
+      "author": "spec-kit-core",
+      "repository": "https://github.com/github/spec-kit",
+      "bundled": true,
+      "tags": [
+        "prd",
+        "planning",
+        "specification",
+        "bmad",
+        "openspec",
+        "taskmaster",
+        "v3.5-protocol"
+      ]
     }
   }
 }
