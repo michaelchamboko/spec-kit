@@ -54,5 +54,28 @@ artifact_paths:
   spec_of_specs: "000-spec-of-specs"
   slices_prefix: ""
 
-# Manifest version
-manifest_version: "1.0"
+# Manifest version (1.0 legacy accepted; 1.1 produced after approve or
+# after ``speckit.prd.orchestrate action=initialize``).
+manifest_version: "1.1"
+
+# Orchestration ledger schema. Legacy "1.0" plans are read-only until
+# they pass through ``speckit.prd.orchestrate action=initialize``, which
+# validates every existing task ID and emits the 1.1 ledger without
+# renumbering.
+orchestrate:
+  schema_version: "1.1"
+  one_active_task_invariant: true
+  require_regression_per_slice: true
+  require_cross_slice_e2e_before_final: true
+  documentation_authority:
+    preferred: "context7"
+    accepted_fallback: "official"
+    fail_closed_when_missing: true
+
+# Plan behavior
+plan:
+  manifest_schema_legacy_accepted: "1.0"
+  manifest_schema_current: "1.1"
+  evidence_required_for_complete: true
+  refuse_plan_ready_without_ledger: true
+  emit_orchestration_ledger_on_approve: true

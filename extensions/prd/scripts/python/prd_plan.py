@@ -27,7 +27,8 @@ Usage::
 from __future__ import annotations
 
 import datetime as _dt
-import os
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -44,6 +45,46 @@ ARTIFACT_DIRNAME = "000-spec-of-specs"
 
 def _utc_now_iso() -> str:
     return _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _git_head(project_root: Path) -> str:
+    """Return the current ``git rev-parse HEAD`` or empty when not a repo."""
+    if shutil.which("git") is None:
+        return ""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(project_root), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    if result.returncode != 0:
+        return ""
+    return result.stdout.strip()
+
+
+def _git_dirty_fingerprint(project_root: Path) -> str:
+    """Return a stable fingerprint of the current working-tree state.
+
+    SHA-256 of ``git status --porcelain`` (empty tree returns the empty
+    digest). Mirrors the bash twin's implementation.
+    """
+    if shutil.which("git") is None:
+        return ""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(project_root), "status", "--porcelain"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    if result.returncode != 0:
+        return ""
+    return common.sha256_bytes(result.stdout.encode("utf-8"))
 
 
 def _read_local_source(source_path: Path) -> bytes:
@@ -105,12 +146,18 @@ def cmd_intake(
     )
 
     manifest = {
-        "schema_version": "1.0",
+        "schema_version": "1.1",
         "extension": "prd",
         "slug": slug,
         "state": "AWAITING_DECOMPOSITION_APPROVAL",
         "created_at": _utc_now_iso(),
         "active_version": DEFAULT_VERSION,
+        "repository": {
+            "root": str(project_root),
+            "head": _git_head(project_root),
+            "dirty_fingerprint": _git_dirty_fingerprint(project_root),
+            "applicable_instructions": "",
+        },
         "source": {
             "authority": (
                 "file"
@@ -156,6 +203,10 @@ def cmd_approve(
     metadata (id, slug, dependencies) after decomposition and Council
     review. When ``slices`` is ``None``, the script freezes whatever the
     manifest already records.
+
+    Also materializes the ``1.1`` orchestration ledger alongside the
+    manifest on the same atomic write. Refuses to advance if the ledger
+    cannot be written.
     """
     prd_dir = common.safe_create_dir(
         project_root / ".specify" / "specs", project_root
@@ -210,9 +261,7 @@ def cmd_approve(
         directory = str(slice_meta.get("directory") or "").strip()
         if not directory:
             directory = f"{prefix}-{common.normalize_slug(slice_slug)}"
-        slice_dir = common.safe_create_dir(
-            prd_dir / directory, project_root
-        )
+        common.safe_create_dir(prd_dir / directory, project_root)
         materialized.append(
             {
                 "id": slice_meta.get("id") or f"SLC-{index:03d}",
@@ -230,10 +279,47 @@ def cmd_approve(
 
     common.write_manifest(artifact_dir, project_root, manifest)
 
+    # Build and write the orchestration ledger (1.1). Use the manifest's
+    # repository fingerprint if present so the ledger matches what the
+    # command body recorded at intake/approve time.
+    repo_head = str(manifest.get("repository", {}).get("head", ""))
+    dirty_fingerprint = str(
+        manifest.get("repository", {}).get("dirty_fingerprint", "")
+    )
+    applicable_instructions = str(
+        manifest.get("repository", {}).get("applicable_instructions", "")
+    )
+    ledger = common.build_ledger_from_manifest(
+        project_root,
+        slug,
+        manifest,
+        repo_head=repo_head,
+        dirty_fingerprint=dirty_fingerprint,
+        applicable_instructions=applicable_instructions,
+    )
+    common.bump_revision(ledger)
+    ledger["project"]["state"] = "NOT_STARTED"
+    try:
+        lock = common.acquire_ledger_lock(artifact_dir, project_root)
+        try:
+            common.write_ledger(artifact_dir, project_root, ledger)
+        finally:
+            common.release_ledger_lock(lock)
+    except OSError as exc:
+        common.err(
+            f"ERROR: failed to write orchestration ledger: {exc}"
+        )
+        raise SystemExit(1) from exc
+
     return {
         "status": "PLANNING",
         "slug": slug,
         "manifest": str((artifact_dir / "manifest.yml").relative_to(project_root)),
+        "ledger": str(
+            (artifact_dir / common.ORCHESTRATION_LEDGER_FILENAME).relative_to(
+                project_root
+            )
+        ),
         "materialized_slices": [m["directory"] for m in materialized],
     }
 
@@ -242,14 +328,43 @@ def cmd_finalize(
     project_root: Path,
     slug: str,
 ) -> dict[str, object]:
-    """Mark the workspace as ``PLAN_READY`` after the final Council review."""
+    """Mark the workspace as ``PLAN_READY`` after the final Council review.
+
+    Refuses to advance when the orchestration ledger is missing or
+    malformed: ``PLAN_READY`` is a precondition for the waterfall
+    orchestrator, and shipping a plan without a ledger means the
+    orchestrator would refuse every action.
+    """
     prd_dir = (
         common.safe_create_dir(project_root / ".specify" / "specs", project_root)
         / slug
     )
     artifact_dir = common.safe_create_dir(prd_dir / ARTIFACT_DIRNAME, project_root)
     manifest = common.load_manifest(artifact_dir) or {}
+
+    # Refuse without a well-formed ledger. Mirrors the contract enforced
+    # by ``prd_validate.py`` and described in the command spec.
+    ledger = common.load_ledger(artifact_dir, project_root)
+    if ledger is None:
+        common.err(
+            "ERROR: orchestration ledger missing at "
+            f"{artifact_dir / common.ORCHESTRATION_LEDGER_FILENAME}; "
+            "run speckit.prd.orchestrate action=initialize to materialize "
+            "it (or re-run speckit.prd.plan slug=<slug> approve=true to "
+            "regenerate it)."
+        )
+        raise SystemExit(2)
+    if str(ledger.get("schema_version", "")) != common.ORCHESTRATION_LEDGER_SCHEMA_VERSION:
+        common.err(
+            "ERROR: orchestration ledger schema_version is "
+            f"{ledger.get('schema_version')!r}; expected "
+            f"{common.ORCHESTRATION_LEDGER_SCHEMA_VERSION!r}. Re-run "
+            "speckit.prd.orchestrate action=initialize to migrate."
+        )
+        raise SystemExit(2)
+
     manifest["state"] = "PLAN_READY"
+    manifest["schema_version"] = common.ORCHESTRATION_LEDGER_SCHEMA_VERSION
     manifest["final_review_version"] = DEFAULT_VERSION
     manifest["finalized_at"] = _utc_now_iso()
     common.write_manifest(artifact_dir, project_root, manifest)
@@ -257,6 +372,11 @@ def cmd_finalize(
         "status": "PLAN_READY",
         "slug": slug,
         "manifest": str((artifact_dir / "manifest.yml").relative_to(project_root)),
+        "ledger": str(
+            (artifact_dir / common.ORCHESTRATION_LEDGER_FILENAME).relative_to(
+                project_root
+            )
+        ),
     }
 
 

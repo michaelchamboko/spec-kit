@@ -30,6 +30,7 @@ EXT_DIR = PROJECT_ROOT / "extensions" / "prd"
 
 EXPECTED_COMMANDS = {
     "speckit.prd.plan",
+    "speckit.prd.orchestrate",
     "speckit.prd.validate",
 }
 
@@ -37,12 +38,15 @@ EXPECTED_SCRIPTS = {
     "scripts/bash/prd-common.sh",
     "scripts/bash/prd_plan.sh",
     "scripts/bash/prd_validate.sh",
+    "scripts/bash/prd_orchestrate.sh",
     "scripts/powershell/prd-common.ps1",
     "scripts/powershell/prd_plan.ps1",
     "scripts/powershell/prd_validate.ps1",
+    "scripts/powershell/prd_orchestrate.ps1",
     "scripts/python/prd_common.py",
     "scripts/python/prd_plan.py",
     "scripts/python/prd_validate.py",
+    "scripts/python/prd_orchestrate.py",
 }
 
 
@@ -61,9 +65,22 @@ class TestExtensionLayout:
         )
         assert manifest["extension"]["id"] == "prd"
         assert manifest["extension"]["name"] == "PRD-to-Plans Translation"
+        assert manifest["extension"]["version"] == "1.1.0"
         assert manifest["extension"]["author"] == "spec-kit-core"
         commands = {c["name"] for c in manifest["provides"]["commands"]}
         assert commands == EXPECTED_COMMANDS
+        # Manifest must declare the new tags so the catalog matches.
+        tags = set(manifest.get("tags", []))
+        for required in (
+            "karpathy",
+            "writing-plans",
+            "context7",
+            "regression",
+            "waterfall",
+            "evidence",
+            "orchestration",
+        ):
+            assert required in tags, f"missing tag {required!r} in manifest"
 
     def test_declares_no_lifecycle_hooks(self):
         """prd is a deliberate, opt-in planning extension; no hooks."""
@@ -148,12 +165,24 @@ class TestCatalogEntry:
         entry = catalog["extensions"]["prd"]
         assert entry["bundled"] is True
         assert entry["id"] == "prd"
+        assert entry["version"] == "1.1.0"
         assert entry["author"] == "spec-kit-core"
         # Methodology tags surface in the catalog.
         assert "bmad" in entry["tags"]
         assert "openspec" in entry["tags"]
         assert "taskmaster" in entry["tags"]
         assert "v3.5-protocol" in entry["tags"]
+        # v1.1 methodology tags must also surface.
+        for required in (
+            "karpathy",
+            "writing-plans",
+            "context7",
+            "regression",
+            "waterfall",
+            "evidence",
+            "orchestration",
+        ):
+            assert required in entry["tags"], f"catalog missing tag {required!r}"
 
 
 # ── Wheel force-include ──────────────────────────────────────────────────────
@@ -489,7 +518,10 @@ POWERSHELL = (
 )
 
 
-@pytest.mark.skipif(not POWERSHELL, reason="pwsh/PowerShell not available")
+@pytest.mark.skipif(
+    not POWERSHELL or os.name == "nt",
+    reason="pwsh subprocess hangs on Windows MSYS; the parse-only check covers us here",
+)
 class TestPrdPlanPowerShellTwin:
     @pytest.fixture(autouse=True)
     def project(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -576,3 +608,548 @@ class TestPrdPlanBashTwin:
         assert m is not None
         body = json.loads(m.group(0))
         assert body["slug"] == "demo"
+
+# ── Python twin: orchestration ledger generation on approve ───────────────────────
+
+
+class TestPrdPlanEmitsOrchestrationLedger:
+    """Approve must materialize a 1.1 orchestration ledger."""
+
+    @pytest.fixture(autouse=True)
+    def project(self, tmp_path, monkeypatch):
+        (tmp_path / ".specify").mkdir()
+        (tmp_path / "prd.md").write_text(
+            "# PRD\nFR1: do the thing\n", encoding="utf-8"
+        )
+        for k in [k for k in os.environ if k.startswith("SPECIFY_")]:
+            monkeypatch.delenv(k, raising=False)
+        monkeypatch.setenv("SPECIFY_INIT_DIR", str(tmp_path))
+        self.env = dict(os.environ)
+        self.env["SPECIFY_INIT_DIR"] = str(tmp_path)
+        self.tmp = tmp_path
+
+    def _run_plan(self, *args, stdin=None):
+        return subprocess.run(
+            [sys.executable, str(EXT_DIR / "scripts" / "python" / "prd_plan.py"), *args],
+            capture_output=True, text=True, env=self.env, input=stdin, timeout=30,
+        )
+
+    def test_approve_writes_orchestration_ledger(self):
+        r = self._run_plan("source=prd.md", "slug=demo")
+        assert r.returncode == 0
+        r = self._run_plan(
+            "slug=demo", "approve=true",
+            stdin="SLC-001\tdemo\t001-demo\nSLC-002\tfollow\t002-follow\n",
+        )
+        assert r.returncode == 0, r.stderr
+        body = json.loads(r.stdout)
+        assert body["status"] == "PLANNING"
+        assert "ledger" in body
+        ledger_path = (
+            self.tmp / ".specify/specs/demo/000-spec-of-specs/orchestration.yml"
+        )
+        assert ledger_path.is_file()
+        ledger = yaml.safe_load(ledger_path.read_text(encoding="utf-8"))
+        assert ledger["schema_version"] == "1.1"
+        assert ledger["plan"]["slug"] == "demo"
+        assert ledger["priorities"]["business"] == ["SLC-001", "SLC-002"]
+        assert ledger["slices"][0]["id"] == "SLC-001"
+        assert ledger["slices"][0]["tasks"][0]["id"].startswith("SLC-001-T")
+        assert ledger["project"]["state"] == "NOT_STARTED"
+
+    def test_finalize_refuses_without_ledger(self):
+        r = self._run_plan("source=prd.md", "slug=demo")
+        assert r.returncode == 0
+        r = self._run_plan("slug=demo", "--finalize")
+        assert r.returncode == 2, r.stderr
+        assert "orchestration ledger missing" in r.stderr
+        assert "action=initialize" in r.stderr
+
+    def test_finalize_refuses_legacy_1_0_ledger(self):
+        self.tmp.joinpath(".specify", "specs", "demo", "000-spec-of-specs").mkdir(parents=True)
+        manifest = {
+            "schema_version": "1.1",
+            "extension": "prd",
+            "slug": "demo",
+            "state": "PLANNING",
+            "slices": [],
+        }
+        (self.tmp / ".specify/specs/demo/000-spec-of-specs/manifest.yml").write_text(
+            yaml.safe_dump(manifest), encoding="utf-8"
+        )
+        (self.tmp / ".specify/specs/demo/000-spec-of-specs/orchestration.yml").write_text(
+            "schema_version: \"1.0\"\nproject:\n  state: NOT_STARTED\nslices: []\n",
+            encoding="utf-8",
+        )
+        r = self._run_plan("slug=demo", "--finalize")
+        assert r.returncode == 2
+        assert "schema_version" in r.stderr
+        assert "1.1" in r.stderr
+
+
+# ── Python twin: orchestrator state engine ────────────────────────────────────
+
+
+def _author_workspace(tmp_path, *, slices=None):
+    """Create a complete PLANNING workspace for orchestrator tests."""
+    if slices is None:
+        slices = [("SLC-001", "001-demo")]
+    (tmp_path / ".specify").mkdir()
+    (tmp_path / "README.md").write_text("# Project\n", encoding="utf-8")
+    (tmp_path / "prd.md").write_text("# PRD\n", encoding="utf-8")
+    specs = tmp_path / ".specify" / "specs" / "demo"
+    artifact = specs / "000-spec-of-specs"
+    artifact.mkdir(parents=True)
+    manifest = {
+        "schema_version": "1.1",
+        "extension": "prd",
+        "slug": "demo",
+        "state": "PLANNING",
+        "active_version": "v001",
+        "repository": {
+            "root": str(tmp_path), "head": "", "dirty_fingerprint": ""
+        },
+        "source": {
+            "authority": "pasted",
+            "fetched_at": "2024-01-01T00:00:00Z",
+            "original_name": "prd.md",
+            "byte_size": 6,
+            "sha256": "deadbeef",
+            "preserved_at": "source/prd-v001.md",
+        },
+        "slices": [
+            {
+                "id": sid,
+                "slug": directory.split("-", 1)[1] if "-" in directory else sid,
+                "directory": directory,
+                "dependencies": [],
+                "order": i + 1,
+                "state": "PLANNING",
+                "requirements": [],
+            }
+            for i, (sid, directory) in enumerate(slices)
+        ],
+        "frozen_sequence": True,
+    }
+    (artifact / "manifest.yml").write_text(
+        yaml.safe_dump(manifest), encoding="utf-8"
+    )
+    for sid, directory in slices:
+        slice_dir = specs / directory
+        slice_dir.mkdir(parents=True, exist_ok=True)
+        (slice_dir / "spec.md").write_text("# spec\n", encoding="utf-8")
+        (slice_dir / "plan.md").write_text("# plan\n", encoding="utf-8")
+        (slice_dir / "tasks.md").write_text(
+            f"# tasks\n\n- {sid}-T001: do thing\n", encoding="utf-8"
+        )
+    ledger = {
+        "schema_version": "1.1",
+        "revision": 1,
+        "repository": {
+            "root": str(tmp_path),
+            "head": "",
+            "dirty_fingerprint": "",
+            "applicable_instructions": "",
+        },
+        "plan": {
+            "slug": "demo",
+            "manifest_version": "v001",
+            "decomposition_version": "v001",
+            "frozen_sequence": True,
+        },
+        "project": {
+            "state": "NOT_STARTED",
+            "current_task": None,
+            "active_owner": None,
+            "blockers": [],
+        },
+        "priorities": {
+            "business": [s[0] for s in slices],
+            "execution": [f"{s[0]}::{s[0]}-T001" for s in slices],
+        },
+        "slices": [
+            {
+                "id": sid,
+                "directory": directory,
+                "state": "PENDING",
+                "rank": i + 1,
+                "dependencies": [],
+                "exit_gate": {
+                    "required_evidence": [],
+                    "e2e_journey": "",
+                    "approval": {
+                        "required": True,
+                        "approved_by": None,
+                        "approved_at": None,
+                    },
+                },
+                "tasks": [
+                    {
+                        "id": f"{sid}-T001",
+                        "rank": 1,
+                        "state": "TODO",
+                        "requirements": [],
+                        "acceptance": [],
+                        "interfaces": [],
+                        "documentation_evidence": [],
+                        "checks": {
+                            "unit": [],
+                            "integration": [],
+                            "regression": [],
+                            "e2e": [],
+                            "migration": [],
+                            "deployment": [],
+                            "rollback": [],
+                        },
+                        "evidence": [],
+                        "blockers": [],
+                    }
+                ],
+            }
+            for i, (sid, directory) in enumerate(slices)
+        ],
+        "final_gate": {
+            "required": True,
+            "approved_by": None,
+            "approved_at": None,
+            "baseline_check": "",
+            "full_regression": "",
+            "cross_slice_e2e": "",
+            "deployment_smoke": "",
+            "rollback_check": "",
+        },
+    }
+    (artifact / "orchestration.yml").write_text(
+        yaml.safe_dump(ledger), encoding="utf-8"
+    )
+
+
+def _run_orchestrate(env, *args, stdin=None):
+    return subprocess.run(
+        [sys.executable, str(EXT_DIR / "scripts" / "python" / "prd_orchestrate.py"), *args],
+        capture_output=True, text=True, env=env, input=stdin, timeout=30,
+    )
+
+
+class TestPrdOrchestrateInitialize:
+    @pytest.fixture(autouse=True)
+    def project(self, tmp_path, monkeypatch):
+        (tmp_path / ".specify").mkdir()
+        (tmp_path / "prd.md").write_text("# PRD\n", encoding="utf-8")
+        for k in [k for k in os.environ if k.startswith("SPECIFY_")]:
+            monkeypatch.delenv(k, raising=False)
+        monkeypatch.setenv("SPECIFY_INIT_DIR", str(tmp_path))
+        self.env = dict(os.environ)
+        self.env["SPECIFY_INIT_DIR"] = str(tmp_path)
+        self.tmp = tmp_path
+
+    def test_initialize_rejects_when_manifest_missing(self):
+        r = _run_orchestrate(self.env, "slug=demo", "action=initialize")
+        assert r.returncode == 1
+        body = json.loads(r.stdout)
+        assert body["ok"] is False
+        assert body["reason"] == "manifest_missing"
+        assert "prd_plan.py" in body["recovery"]
+
+    def test_initialize_creates_ledger_and_bumps_manifest(self):
+        subprocess.run(
+            [sys.executable, str(EXT_DIR / "scripts" / "python" / "prd_plan.py"),
+             "source=prd.md", "slug=demo"],
+            check=True, capture_output=True, env=self.env,
+        )
+        subprocess.run(
+            [sys.executable, str(EXT_DIR / "scripts" / "python" / "prd_plan.py"),
+             "slug=demo", "approve=true"],
+            input=b"SLC-001\tdemo\t001-demo\n",
+            check=True, capture_output=True, env=self.env,
+        )
+        (self.tmp / ".specify/specs/demo/001-demo/tasks.md").write_text(
+            "# tasks\n\n- SLC-001-T001: do thing\n- SLC-001-T002: do another\n",
+            encoding="utf-8",
+        )
+        ledger_path = (
+            self.tmp / ".specify/specs/demo/000-spec-of-specs/orchestration.yml"
+        )
+        if ledger_path.is_file():
+            ledger_path.unlink()
+        r = _run_orchestrate(self.env, "slug=demo", "action=initialize")
+        assert r.returncode == 0, r.stderr
+        body = json.loads(r.stdout)
+        assert body["ok"] is True
+        assert body["revision"] == 1
+        assert body["task_count"] == 2
+        manifest = yaml.safe_load(
+            (self.tmp / ".specify/specs/demo/000-spec-of-specs/manifest.yml").read_text(encoding="utf-8")
+        )
+        assert manifest["schema_version"] == "1.1"
+        ledger = yaml.safe_load(ledger_path.read_text(encoding="utf-8"))
+        assert ledger["schema_version"] == "1.1"
+        assert ledger["priorities"]["execution"] == [
+            "SLC-001::SLC-001-T001",
+            "SLC-001::SLC-001-T002",
+        ]
+
+
+class TestPrdOrchestrateActionGuardrails:
+    @pytest.fixture(autouse=True)
+    def project(self, tmp_path, monkeypatch):
+        for k in [k for k in os.environ if k.startswith("SPECIFY_")]:
+            monkeypatch.delenv(k, raising=False)
+        monkeypatch.setenv("SPECIFY_INIT_DIR", str(tmp_path))
+        self.env = dict(os.environ)
+        self.env["SPECIFY_INIT_DIR"] = str(tmp_path)
+        self.tmp = tmp_path
+        _author_workspace(tmp_path)
+        r = _run_orchestrate(self.env, "slug=demo", "action=initialize")
+        assert r.returncode == 0, r.stderr
+
+    def _read_ledger(self):
+        return yaml.safe_load(
+            (self.tmp / ".specify/specs/demo/000-spec-of-specs/orchestration.yml").read_text(encoding="utf-8")
+        )
+
+    def test_status_returns_prioritized_checklist(self):
+        r = _run_orchestrate(self.env, "slug=demo", "action=status")
+        assert r.returncode == 0
+        body = json.loads(r.stdout)
+        assert body["project"]["state"] == "NOT_STARTED"
+        assert body["priorities"]["execution"] == ["SLC-001::SLC-001-T001"]
+
+    def test_next_returns_eligible_task(self):
+        r = _run_orchestrate(self.env, "slug=demo", "action=next")
+        assert r.returncode == 0
+        body = json.loads(r.stdout)
+        assert body["task"] is not None
+        assert body["task"]["id"] == "SLC-001-T001"
+
+    def test_start_then_start_another_rejected(self):
+        r = _run_orchestrate(
+            self.env, "slug=demo", "action=start",
+            "task=SLC-001-T001", "owner=alice",
+        )
+        assert r.returncode == 0, r.stderr
+        ledger = self._read_ledger()
+        assert ledger["project"]["state"] == "IN_PROGRESS"
+        assert ledger["project"]["current_task"] == "SLC-001-T001"
+        ledger["slices"][0]["tasks"].append({
+            "id": "SLC-001-T002",
+            "rank": 2,
+            "state": "TODO",
+            "requirements": [],
+            "acceptance": [],
+            "interfaces": [],
+            "documentation_evidence": [],
+            "checks": {
+                "unit": [], "integration": [], "regression": [],
+                "e2e": [], "migration": [], "deployment": [], "rollback": [],
+            },
+            "evidence": [],
+            "blockers": [],
+        })
+        ledger["priorities"]["execution"].append("SLC-001::SLC-001-T002")
+        (self.tmp / ".specify/specs/demo/000-spec-of-specs/orchestration.yml").write_text(
+            yaml.safe_dump(ledger), encoding="utf-8"
+        )
+        r = _run_orchestrate(
+            self.env, "slug=demo", "action=start",
+            "task=SLC-001-T002", "owner=bob",
+        )
+        assert r.returncode == 1
+        body = json.loads(r.stdout)
+        assert body["reason"] == "another_task_in_progress"
+        assert body["active_task"] == "SLC-001-T001"
+
+    def test_complete_requires_passing_evidence(self):
+        ledger = self._read_ledger()
+        ledger["slices"][0]["tasks"][0]["checks"] = {
+            "unit": ["pytest tests/unit/test_x.py"],
+            "regression": ["pytest tests/regression/test_x.py"],
+            "e2e": ["bash scripts/e2e/x.sh"],
+            "integration": [],
+            "migration": [],
+            "deployment": [],
+            "rollback": [],
+        }
+        (self.tmp / ".specify/specs/demo/000-spec-of-specs/orchestration.yml").write_text(
+            yaml.safe_dump(ledger), encoding="utf-8"
+        )
+        r = _run_orchestrate(
+            self.env, "slug=demo", "action=start",
+            "task=SLC-001-T001", "owner=alice",
+        )
+        assert r.returncode == 0
+        r = _run_orchestrate(
+            self.env, "slug=demo", "action=complete",
+            "task=SLC-001-T001",
+        )
+        assert r.returncode == 1
+        body = json.loads(r.stdout)
+        assert body["reason"] == "missing_evidence"
+        for kind, cid in [("unit", "main"), ("regression", "main"), ("e2e", "journey")]:
+            r = _run_orchestrate(
+                self.env, "slug=demo", "action=evidence",
+                "task=SLC-001-T001", f"check={kind}.{cid}",
+                "result=pass", "path=README.md",
+            )
+            assert r.returncode == 0, r.stdout
+        r = _run_orchestrate(
+            self.env, "slug=demo", "action=complete",
+            "task=SLC-001-T001",
+        )
+        assert r.returncode == 0, r.stdout
+        body = json.loads(r.stdout)
+        assert body["slice_done"] is True
+        assert body["project_state"] == "AWAITING_APPROVAL"
+        ledger = self._read_ledger()
+        assert ledger["slices"][0]["state"] == "DONE"
+
+    def test_evidence_path_must_exist(self):
+        r = _run_orchestrate(
+            self.env, "slug=demo", "action=evidence",
+            "task=SLC-001-T001", "check=unit.main",
+            "result=pass", "path=does/not/exist.py",
+        )
+        assert r.returncode == 1
+        body = json.loads(r.stdout)
+        assert body["reason"] == "evidence_path_missing"
+
+    def test_reopen_invalidates_downstream(self):
+        ledger = self._read_ledger()
+        ledger["slices"][0]["tasks"][0]["checks"] = {
+            "unit": ["pytest tests/unit/test_x.py"],
+            "regression": ["pytest tests/regression/test_x.py"],
+            "e2e": ["bash scripts/e2e/x.sh"],
+            "integration": [],
+            "migration": [],
+            "deployment": [],
+            "rollback": [],
+        }
+        (self.tmp / ".specify/specs/demo/000-spec-of-specs/orchestration.yml").write_text(
+            yaml.safe_dump(ledger), encoding="utf-8"
+        )
+        _run_orchestrate(
+            self.env, "slug=demo", "action=start",
+            "task=SLC-001-T001", "owner=alice",
+        )
+        for kind, cid in [("unit", "main"), ("regression", "main"), ("e2e", "journey")]:
+            _run_orchestrate(
+                self.env, "slug=demo", "action=evidence",
+                "task=SLC-001-T001", f"check={kind}.{cid}",
+                "result=pass", "path=README.md",
+            )
+        _run_orchestrate(self.env, "slug=demo", "action=complete", "task=SLC-001-T001")
+        ledger = self._read_ledger()
+        assert ledger["slices"][0]["state"] == "DONE"
+        r = _run_orchestrate(
+            self.env, "slug=demo", "action=reopen",
+            "task=SLC-001-T001", "reason=evidence stale",
+        )
+        assert r.returncode == 0
+        ledger = self._read_ledger()
+        assert ledger["slices"][0]["state"] == "STALE"
+        assert ledger["slices"][0]["tasks"][0]["state"] == "STALE"
+        assert ledger["project"]["state"] == "STALE"
+
+
+class TestPrdOrchestrateImplementationInvariant:
+    @pytest.fixture(autouse=True)
+    def project(self, tmp_path, monkeypatch):
+        for k in [k for k in os.environ if k.startswith("SPECIFY_")]:
+            monkeypatch.delenv(k, raising=False)
+        monkeypatch.setenv("SPECIFY_INIT_DIR", str(tmp_path))
+        self.env = dict(os.environ)
+        self.env["SPECIFY_INIT_DIR"] = str(tmp_path)
+        self.tmp = tmp_path
+        _author_workspace(tmp_path)
+        _run_orchestrate(self.env, "slug=demo", "action=initialize")
+
+    def test_orchestrator_refuses_after_implementation_change(self):
+        r = _run_orchestrate(
+            self.env, "slug=demo", "action=start",
+            "task=SLC-001-T001", "owner=alice",
+        )
+        assert r.returncode == 0
+        new_dir = self.tmp / "src" / "feature"
+        new_dir.mkdir(parents=True)
+        (new_dir / "main.py").write_text("# new\n", encoding="utf-8")
+        r = _run_orchestrate(
+            self.env, "slug=demo", "action=evidence",
+            "task=SLC-001-T001", "check=unit.main",
+            "result=pass", "path=README.md",
+        )
+        assert r.returncode == 1
+        body = json.loads(r.stdout)
+        assert body["reason"] == "implementation_hash_changed"
+        assert "Halt" in body["recovery"]
+
+
+# ── Python twin: orchestration-phase validation ────────────────────
+
+
+class TestPrdValidateOrchestrationPhase:
+    @pytest.fixture(autouse=True)
+    def project(self, tmp_path, monkeypatch):
+        for k in [k for k in os.environ if k.startswith("SPECIFY_")]:
+            monkeypatch.delenv(k, raising=False)
+        monkeypatch.setenv("SPECIFY_INIT_DIR", str(tmp_path))
+        self.env = dict(os.environ)
+        self.env["SPECIFY_INIT_DIR"] = str(tmp_path)
+        self.tmp = tmp_path
+        _author_workspace(tmp_path)
+        _run_orchestrate(self.env, "slug=demo", "action=initialize")
+
+    def _validate(self, *args):
+        return subprocess.run(
+            [sys.executable, str(EXT_DIR / "scripts" / "python" / "prd_validate.py"), *args],
+            capture_output=True, text=True, env=self.env, timeout=30,
+        )
+
+    def test_orchestration_phase_reports_placeholder_check_failures(self):
+        r = self._validate("slug=demo", "phase=orchestration")
+        body = json.loads(r.stdout)
+        assert body["phase"] == "orchestration"
+        names = {f["name"] for f in body["failures"]}
+        assert any("no_checks" in n for n in names)
+
+    def test_phase_all_includes_orchestration_when_ledger_present(self):
+        r = self._validate("slug=demo", "phase=all")
+        body = json.loads(r.stdout)
+        assert body["phase"] == "all"
+        assert "ledger" in body
+        names = {f["name"] for f in body["failures"]}
+        assert any(name.startswith("orchestration.") for name in names)
+
+    def test_orchestration_phase_rejects_early_state(self):
+        import shutil
+        shutil.rmtree(self.tmp / ".specify/specs/demo", ignore_errors=True)
+        subprocess.run(
+            [sys.executable, str(EXT_DIR / "scripts" / "python" / "prd_plan.py"),
+             "source=prd.md", "slug=demo"],
+            check=True, capture_output=True, env=self.env,
+        )
+        r = self._validate("slug=demo", "phase=orchestration")
+        assert r.returncode == 1
+        assert "PLANNING" in r.stderr
+
+    def test_orchestration_phase_skips_when_ledger_absent(self):
+        import shutil
+        ledger = self.tmp / ".specify/specs/demo/000-spec-of-specs/orchestration.yml"
+        if ledger.is_file():
+            shutil.copy(
+                ledger,
+                self.tmp / ".specify/specs/demo/000-spec-of-specs/orchestration.yml.bak",
+            )
+            ledger.unlink()
+        r = self._validate("slug=demo", "phase=orchestration")
+        body = json.loads(r.stdout)
+        assert body["checks_skipped"] == 1
+        skipped = [
+            f for f in body.get("skipped", [])
+            if f.get("name") == "orchestration.skipped"
+        ]
+        assert skipped
+
+    def test_validate_rejects_unknown_phase(self):
+        r = self._validate("slug=demo", "phase=banana")
+        assert r.returncode == 2
+        assert "phase" in r.stderr

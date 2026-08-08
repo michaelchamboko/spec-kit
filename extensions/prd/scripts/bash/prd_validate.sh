@@ -6,7 +6,7 @@
 # requirements, slice graph, and Council review artifacts.
 #
 # Usage:
-#   prd_validate.sh slug=<slug> [phase=decomposition|final|all]
+#   prd_validate.sh slug=<slug> [phase=decomposition|final|orchestration|all]
 
 set -euo pipefail
 
@@ -18,7 +18,7 @@ ARTIFACT_DIRNAME="000-spec-of-specs"
 
 usage() {
     cat <<'USAGE'
-Usage: prd_validate.sh slug=<slug> [phase=decomposition|final|all]
+Usage: prd_validate.sh slug=<slug> [phase=decomposition|final|orchestration|all]
 USAGE
 }
 
@@ -191,8 +191,8 @@ main() {
     local slug
     slug=$(normalize_slug "$raw_slug") || return 1
 
-    if [[ ! "$phase" =~ ^(decomposition|final|all)$ ]]; then
-        err "ERROR: phase must be decomposition|final|all (got $phase)"
+    if [[ ! "$phase" =~ ^(decomposition|final|orchestration|all)$ ]]; then
+        err "ERROR: phase must be decomposition|final|orchestration|all (got $phase)"
         return 2
     fi
 

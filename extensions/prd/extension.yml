@@ -2,8 +2,8 @@ schema_version: "1.0"
 extension:
   id: prd
   name: "PRD-to-Plans Translation"
-  version: "1.0.0"
-  description: "Converts a PRD into a codebase-aware spec-of-specs, numbered vertical-slice specifications, and implementation-ready task packets using Spec Kit, BMAD, OpenSpec, Taskmaster, and v3.5 protocol methodologies."
+  version: "1.1.0"
+  description: "Converts a PRD into a codebase-aware spec-of-specs, numbered vertical-slice specifications, implementation-ready task packets, and a deterministic one-task-at-a-time waterfall orchestrator. Composes Spec Kit, BMAD, OpenSpec, Taskmaster, v3.5 Council protocol, Karpathy simplicity rules, writing-plans methodology, architecture analysis, Context7-backed technical research, and complete regression planning."
   author: "spec-kit-core"
   repository: https://github.com/github/spec-kit
   license: MIT
@@ -22,10 +22,13 @@ provides:
   commands:
     - name: speckit.prd.plan
       file: commands/speckit.prd.plan.md
-      description: "Creates or reconciles a PRD workspace; decomposes PRD into spec-of-specs and vertical slices; stops for approval before generating child artifacts"
+      description: "Creates or reconciles a PRD workspace; decomposes PRD into spec-of-specs and vertical slices; produces the orchestration ledger on approve; refuses PLAN_READY without the ledger"
+    - name: speckit.prd.orchestrate
+      file: commands/speckit.prd.orchestrate.md
+      description: "Deterministic, one-task-at-a-time waterfall task manager for the orchestration ledger; records evidence, blockers, reopen, and stage approvals; never edits implementation source"
     - name: speckit.prd.validate
       file: commands/speckit.prd.validate.md
-      description: "Re-runs deterministic structural, traceability, graph-freshness, and readiness checks without modifying source code"
+      description: "Re-runs deterministic structural, traceability, graph-freshness, orchestration-ledger, evidence, regression, and readiness checks without modifying source code"
   config:
     - name: "prd-config.yml"
       template: "config-template.yml"
@@ -42,6 +45,14 @@ tags:
   - "openspec"
   - "taskmaster"
   - "v3.5-protocol"
+  - "karpathy"
+  - "writing-plans"
+  - "architecture"
+  - "context7"
+  - "regression"
+  - "waterfall"
+  - "evidence"
+  - "orchestration"
 
 config:
   defaults:
@@ -59,3 +70,17 @@ config:
     council_lenses: 5
     approval_required: true
     stale_threshold_days: 30
+    orchestrate:
+      schema_version: "1.1"
+      one_active_task_invariant: true
+      require_regression_per_slice: true
+      require_cross_slice_e2e_before_final: true
+      documentation_authority:
+        preferred: "context7"
+        accepted_fallback: "official"
+        fail_closed_when_missing: true
+    plan:
+      manifest_schema_legacy_accepted: "1.0"
+      manifest_schema_current: "1.1"
+      evidence_required_for_complete: true
+      refuse_plan_ready_without_ledger: true

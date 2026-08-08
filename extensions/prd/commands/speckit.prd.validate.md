@@ -1,5 +1,5 @@
 ---
-description: "Re-runs deterministic structural, traceability, graph-freshness, and readiness checks without modifying source code"
+description: "Re-runs deterministic structural, traceability, graph-freshness, orchestration-ledger, evidence, regression, and readiness checks without modifying source code"
 tools:
   - 'bash/prd_validate.sh'
   - 'python/prd_validate.py'
@@ -19,7 +19,7 @@ Re-run deterministic structural, traceability, graph-freshness, and readiness ch
 $ARGUMENTS
 ```
 
-**Parse arguments**: `slug=<slug>` required, optional `phase=decomposition|final`.
+**Parse arguments**: `slug=<slug>` required, optional `phase=decomposition|final|orchestration|all`.
 
 ---
 
@@ -151,6 +151,73 @@ Resolve project root and real, symlink-resolved path of `PRD_DIR/` and every art
 6. **State Consistency**
    - `PLAN_READY` → all child artifacts present and passing
    - `STALE` → reason recorded in manifest per slice
+
+### Phase: orchestration (or all if phase omitted and state >= PLANNING)
+
+Required when the ledger exists. Skip every orchestration check with a
+clear `skipped` reason when the ledger is absent (older `1.0` plans).
+
+1. **Ledger schema and integrity**
+   - `orchestration.yml` parses; `schema_version: "1.1"`
+   - Revision counter monotonically increases on every write
+   - Lock file present during in-flight writes; absent at rest
+   - `priorities.execution` is a strict topological order of all tasks
+   - `priorities.business` preserves the original slice order
+
+2. **One active task invariant**
+   - Across the entire ledger, exactly 0 or 1 task is `IN_PROGRESS`
+   - `project.current_task` and `project.active_owner` agree with the
+     `IN_PROGRESS` task (when present)
+
+3. **Per-slice task correspondence**
+   - Every `SLC-NNN-TMMM` referenced in `tasks.md` has a ledger entry
+     with matching id, requirements, and acceptance IDs
+   - No ledger task references a missing slice directory
+   - No slice directory has a `tasks.md` task without a ledger entry
+
+4. **Strict priority / dependency order**
+   - Every task's `dependencies` resolve to known task IDs
+   - Acyclic dependency graph
+   - No `IN_PROGRESS` task has an unfinished dependency
+
+5. **Requirement / acceptance / architecture coverage**
+   - Every PRD-FR / PRD-NFR is referenced by at least one task
+   - Every AC-SLC-NNN-MMM has a matching task
+   - Every interface entry is `existing:<file>:<symbol>` or
+     `proposed:<file>:<symbol> -> <return-type>` and the existing
+     reference resolves in the repository
+
+6. **Documentation evidence**
+   - Every task with non-trivial new dependencies references a
+     `context7:<lib/id>@<version>` entry or an explicit
+     `official:<url>@<access-ts>` fallback in the ledger
+   - Fail closed when neither is present for any required dependency
+
+7. **Required checks present and decisive**
+   - Every task declares at least one `unit`, one `regression`, and
+     either `e2e` (user-visible slice) or `integration`
+     (internal slice) check
+   - Every check command resolves to a real file on disk OR is a
+     documented short script
+   - No placeholder commands (`echo`, `true`, `pytest`, …)
+
+8. **Approval records and final-gate completeness**
+   - Each `SLC-NNN.exit_gate.approved_by` is null when slice is not
+     `DONE`; required to be non-null when slice is `DONE`
+   - `final_gate.approved_by` is null when project state is not
+     `RELEASE_READY`; required to be non-null when state is
+     `RELEASE_READY`
+   - Every final-gate check (`baseline_check`, `full_regression`,
+     `cross_slice_e2e`, `deployment_smoke`, `rollback_check`) has at
+     least one `pass` evidence entry before `RELEASE_READY`
+
+9. **Implementation-source hash invariant**
+   - When the validate command runs after any orchestrator action,
+     the implementation tree hash (relative paths + contents) MUST
+     equal the `repository.head + repository.dirty_fingerprint`
+     recorded at plan/approve time
+   - Any mismatch is reported as a fatal integrity violation with
+     the exact path(s) that changed
 
 ---
 

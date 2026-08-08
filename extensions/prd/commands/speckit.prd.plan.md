@@ -1,5 +1,5 @@
 ---
-description: "Creates or reconciles a PRD workspace; decomposes PRD into spec-of-specs and vertical slices; stops for approval before generating child artifacts"
+description: "Creates or reconciles a PRD workspace; decomposes PRD into spec-of-specs and vertical slices; produces the orchestration ledger on approve; refuses PLAN_READY without the ledger"
 tools:
   - 'bash/prd_plan.sh'
   - 'python/prd_plan.py'
@@ -328,6 +328,208 @@ artifact_state: "DRAFT|PLAN_READY|STALE"
 
 ---
 
+## Composed Methodology (v1.1)
+
+Every generated plan must satisfy **all** of the following methodology
+disciplines in addition to the existing BMAD / OpenSpec / Taskmaster /
+v3.5 Council rules.
+
+### 1. Karpathy Simplicity Rules
+
+- State **assumptions and unresolved decisions** explicitly in every
+  `plan.md` and `tasks.md`. Unstated premises become bugs.
+- Choose the **smallest working architecture**. Forbid speculative
+  abstractions, premature frameworks, or unrelated refactors.
+- Add no team machinery, model routing, plugin system, or "future
+  hook" the current requirements do not demand.
+- Drop dead code paths, dead config, dead flags, dead branches in
+  the affected surface area as part of the change.
+- Prefer boring technology. New dependency = new risk and new
+  documentation evidence requirement (see §5).
+
+### 2. Writing-Plans Methodology (task-packet shape)
+
+Every task packet in `tasks.md` must include **all** of these fields:
+
+| Field | Meaning |
+|-------|---------|
+| Requirement IDs | Every PRD-FR / PRD-NFR / DEC covered, with source location |
+| Acceptance IDs | Every AC-SLC-NNN-MMM the task verifies |
+| Allowed scope | Exact files / symbols / interfaces the task may change |
+| Forbidden scope | Files / symbols / interfaces the task must not touch |
+| Ordered steps | Numbered, testable steps; deterministic ordering |
+| Decisive completion evidence | Exact command(s) and expected output for "done" |
+| Test-first steps | Where the behavior is testable, write the failing test first |
+| Edge cases | Enumerated failure modes and how the code reacts |
+| Failure behavior | What happens when the contract is violated at runtime |
+| Security notes | Authn/authz, secrets, injection, escalation concerns |
+| Migration notes | Backward-compat / dual-write / cutover steps if any |
+| Observability | Log/metric/trace that the change emits |
+| Deployment | Rollout constraints; feature-flag; canary; SLOs |
+| Rollback | Exact reversal steps; data recovery; blast radius |
+| Recovery trigger | What invalidates this task's evidence (reopens it) |
+
+A task missing any of those fields is rejected by `validate`.
+
+### 3. Architecture Analysis
+
+For every slice, `plan.md` must map, **with evidence file:symbol
+references**, all of:
+
+- Observed architecture (current code) vs proposed target
+  architecture
+- Affected files and symbols (verified, not inferred)
+- Data flow (request → handler → store → response; include side
+  effects)
+- Persistence (migrations, indexes, locks, transactions)
+- Security boundaries (trust zones, authn/authz at every entry)
+- Migrations (forward + backward, dual-write if needed)
+- Observability (logs / metrics / traces; SLOs and alerts)
+- Deployment (config, feature flags, canary, drain)
+- Rollback (per task; aggregated per slice)
+
+### 4. Interfaces
+
+For every consumed or produced interface, the plan must declare one of:
+
+- **Existing symbol** — file path, function/class name, exact signature
+- **Proposed contract** — full signature (parameters, return type,
+  errors) with a `proposed: true` marker and a single owning slice
+
+No `// TBD` signatures. No "we'll figure it out during implementation".
+
+### 5. Context7 / Official Documentation Evidence
+
+For every dependency used by the slice:
+
+1. Detect the version from `pyproject.toml`, `package.json`,
+   `Cargo.toml`, `go.mod`, `requirements*.txt`, lockfiles, etc.
+2. Prefer **Context7 version-specific** documentation. Record the
+   library ID and resolved version in `codegraph.md` (or in the
+   per-slice `plan.md` under `## Documentation evidence`).
+3. If Context7 is unavailable, fall back to **official primary
+   documentation** (the project's own docs site or vendor manual),
+   and record the source URL and access timestamp. This fallback is
+   **explicitly recorded**, never silent.
+4. If no current authoritative technical evidence is available,
+   **fail closed**: the plan cannot advance, the task must be marked
+   `BLOCKED` with reason `missing_documentation_evidence`.
+5. **Never store Context7 credentials, API keys, or tokens in
+   generated artifacts**. Reference them via environment variable
+   names only.
+
+### 6. Regression Planning
+
+Every user-visible slice must declare an **end-to-end** regression
+journey (or integration journey for internal slices). Every task must
+declare the exact command(s) that produce the decisive evidence.
+
+Internal slices (no direct user surface) must declare an equivalent
+**integration** journey that exercises the contract.
+
+The plan command refuses `PLAN_READY` without these declarations.
+
+---
+
+## Orchestration Ledger Generation (on `approve=true`)
+
+When the human approves the decomposition, the script also writes
+`.specify/specs/<slug>/000-spec-of-specs/orchestration.yml`. The
+ledger is the **sole machine-readable task-state authority** for the
+waterfall.
+
+### Ledger contents
+
+```yaml
+schema_version: "1.1"
+repository:
+  root: "<absolute path>"
+  head: "<git commit sha>"
+  dirty_fingerprint: "<sha256 of git status --porcelain>"
+  applicable_instructions: "<path to AGENTS.md or similar>"
+plan:
+  slug: "<prd-slug>"
+  manifest_version: "<vN>"
+  decomposition_version: "<vN>"
+  frozen_sequence: true
+project:
+  state: "NOT_STARTED"   # NOT_STARTED | IN_PROGRESS | BLOCKED | AWAITING_APPROVAL | STALE | RELEASE_READY
+  current_task: null     # SLC-NNN-TMMM id; null when NOT_STARTED / AWAITING_APPROVAL
+  active_owner: null
+  blockers: []
+priorities:
+  business: []           # ordered list of slice ids by business priority
+  execution: []          # ordered list of (slice, task) ids by execution rank
+slices:
+  - id: "SLC-001"
+    directory: "001-<slug>"
+    state: "PENDING"      # PENDING | IN_PROGRESS | DONE | STALE | BLOCKED
+    rank: 1
+    dependencies: []
+    exit_gate:             # required to mark slice DONE
+      required_evidence: []
+      e2e_journey: "<relative path>"
+      approval:
+        required: true
+        approved_by: null
+        approved_at: null
+    tasks:
+      - id: "SLC-001-T001"
+        rank: 1
+        state: "TODO"        # TODO | READY | IN_PROGRESS | BLOCKED | DONE | STALE
+        requirements: ["PRD-FR-001"]
+        acceptance: ["AC-SLC-001-001"]
+        interfaces: ["existing:path.mod.func", "proposed:path.mod.func -> ReturnType"]
+        documentation_evidence: ["context7:lib/id@version"]
+        checks:
+          unit: []
+          integration: []
+          regression: []
+          e2e: []
+          migration: []
+          deployment: []
+          rollback: []
+        evidence: []
+        blockers: []
+final_gate:
+  required: true
+  approved_by: null
+  approved_at: null
+  baseline_check: "<relative path or command>"
+  full_regression: "<relative path or command>"
+  cross_slice_e2e: "<relative path or command>"
+  deployment_smoke: "<relative path or command>"
+  rollback_check: "<relative path or command>"
+```
+
+### Ledger generation rules
+
+1. **Task order**: tasks inside a slice follow the order declared in
+   the slice's `tasks.md`. The slice order is the **frozen approved
+   decomposition order** from `manifest.yml`.
+2. **Priority**: each task receives a **global execution rank** equal
+   to its position in a flattened dependency-respecting traversal.
+   Business priority is preserved separately on each slice.
+3. **One active task invariant**: across the entire ledger exactly
+   one task may be `IN_PROGRESS`. Multiple `IN_PROGRESS` is rejected
+   by `validate`.
+4. **Per-slice E2E required** for every user-visible slice. Internal
+   slices require an **integration journey** instead.
+5. **Mandatory final gate** must declare: repository baseline check,
+   full regression suite, cross-slice E2E journeys, deployment-smoke,
+   rollback check.
+6. **Refuse `PLAN_READY`**: `prd_plan.py --finalize` exits non-zero
+   unless the ledger exists, is well-formed, and every required
+   verification is mapped.
+7. **Legacy `1.0` compatibility**: a manifest with `schema_version:
+   "1.0"` is accepted read-only. Upgrading to `"1.1"` is performed by
+   `speckit.prd.orchestrate action=initialize`, **without renumbering
+   existing IDs**. If the legacy manifest is ambiguous, the
+   initializer fails closed with the exact reason and the single
+   valid recovery action.
+
+---
+
 ## Guardrails
 
 - **Never modify implementation source code** — this extension translates plans only
@@ -336,6 +538,14 @@ artifact_state: "DRAFT|PLAN_READY|STALE"
 - **Path containment** — all reads/writes inside project root, symlink refusal
 - **No placeholder commands** — every task must have exact repository-derived verification commands
 - **Fail closed** — `NEEDS_CLARIFICATION` when evidence insufficient
+- **One active task** — the orchestrator refuses two concurrent
+  `IN_PROGRESS` tasks
+- **Implementation-source hash invariant** — `prd_orchestrate.py` hashes
+  the implementation tree before and after every state-changing
+  action; any implementation-file change is reported as a fatal
+  integrity violation
+- **Never store Context7 credentials or secrets** — generated
+  artifacts reference env-var names only
 
 ---
 

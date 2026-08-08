@@ -13,7 +13,9 @@
 
 .PARAMETER Phase
   Validation phase: ``decomposition`` (default ``AWAITING_DECOMPOSITION_APPROVAL``),
-  ``final`` (``PLANNING`` or ``PLAN_READY``), or ``all`` (the union).
+  ``final`` (``PLANNING`` or ``PLAN_READY``), ``orchestration``
+  (``PLANNING`` or ``PLAN_READY`` with a ledger), or ``all`` (the
+  union). Orchestration checks delegate to the Python validator.
 
 .EXAMPLE
   pwsh -File prd_validate.ps1 -Slug my-feature -Phase decomposition
@@ -21,7 +23,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory=$true)][string]$Slug,
-    [ValidateSet('decomposition','final','all')][string]$Phase = 'all'
+    [ValidateSet('decomposition','final','orchestration','all')][string]$Phase = 'all'
 )
 
 $ErrorActionPreference = 'Stop'

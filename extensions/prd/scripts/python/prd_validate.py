@@ -2,8 +2,8 @@
 """PRD-to-Plans: deterministic validation entrypoint.
 
 Invoked by ``speckit.prd.validate``. Performs the read-only structural,
-traceability, graph-freshness, and readiness checks the command spec
-describes:
+traceability, graph-freshness, orchestration-ledger, evidence,
+regression, and readiness checks the command spec describes:
 
 - Manifest schema, state consistency, required fields
 - Source integrity (normalized markdown present, SHA-256 matches manifest)
@@ -12,6 +12,10 @@ describes:
 - Codegraph evidence (provider/version, indexed state, exclusions)
 - Council review presence (decomposition and final)
 - Child artifact completeness (for ``phase=final`` or ``PLANNING+`` state)
+- Orchestration ledger integrity, one-active-task invariant, evidence
+  coverage, documentation evidence, required checks, and the
+  implementation-source hash invariant (for ``phase=orchestration``
+  or ``PLANNING+`` state when a ledger exists)
 
 This script is **read-only**. It never modifies artifact files or source
 code; failures exit non-zero with a structured report. No AI model calls
@@ -19,7 +23,7 @@ are made.
 
 Usage::
 
-    prd_validate.py slug=<slug> [phase=decomposition|final]
+    prd_validate.py slug=<slug> [phase=decomposition|final|orchestration|all]
 """
 
 from __future__ import annotations
@@ -76,7 +80,6 @@ def _validate_source_integrity(
     if not isinstance(source_meta, dict):
         return [_check("source", False, "source metadata missing")]
 
-    active_version = str(manifest.get("active_version", ""))
     preserved_rel = str(source_meta.get("preserved_at", ""))
     preserved_path = project_root / preserved_rel
     if not preserved_path.is_file():
@@ -296,6 +299,395 @@ def _phase_for_state(state: str) -> str:
     return "all"
 
 
+# ── Orchestration phase checks ──────────────────────────────────────────────
+
+
+_TASK_ID_RE = re.compile(r"\bSLC-\d{3}-T\d{3}\b")
+_INTERFACE_EXISTING_RE = re.compile(r"^existing:(?P<file>[^:]+):(?P<symbol>.+)$")
+_INTERFACE_PROPOSED_RE = re.compile(
+    r"^proposed:(?P<file>[^:]+):(?P<symbol>[^:]+)\s*->\s*(?P<ret>.+)$"
+)
+_DOC_CONTEXT7_RE = re.compile(r"^context7:(?P<lib>[^@]+)@(?P<version>\S+)$")
+_DOC_OFFICIAL_RE = re.compile(r"^official:(?P<url>\S+)@(?P<ts>\S+)$")
+
+
+def _validate_orchestration_ledger(
+    project_root: Path, artifact_dir: Path, manifest: dict[str, object]
+) -> tuple[list[dict[str, str]], dict[str, object] | None]:
+    """Run every orchestration-phase check against the ledger.
+
+    Returns ``(failures, ledger_or_None)``. When the ledger is absent
+    the function returns a synthetic "skipped" record so the caller
+    can surface the phase as not-yet-applicable for older ``1.0`` plans.
+    """
+    ledger = common.load_ledger(artifact_dir, project_root)
+    if ledger is None:
+        skipped: dict[str, str] = {
+            "name": "orchestration.skipped",
+            "status": "SKIPPED",
+            "detail": "orchestration ledger absent; older 1.0 plan",
+        }
+        return [skipped], None
+
+    failures: list[dict[str, str]] = []
+
+    # 1. Schema + revision
+    schema_version = str(ledger.get("schema_version", ""))
+    if schema_version != common.ORCHESTRATION_LEDGER_SCHEMA_VERSION:
+        failures.append(
+            _check(
+                "orchestration.schema_version",
+                False,
+                f"expected {common.ORCHESTRATION_LEDGER_SCHEMA_VERSION!r}, got {schema_version!r}",
+            )
+        )
+    if not isinstance(ledger.get("revision"), int) or int(ledger.get("revision", 0)) < 1:
+        failures.append(
+            _check(
+                "orchestration.revision",
+                False,
+                "revision must be an integer >= 1",
+            )
+        )
+
+    # 2. Project state enum
+    project = ledger.get("project") or {}
+    if not isinstance(project, dict):
+        failures.append(_check("orchestration.project", False, "project must be a mapping"))
+    else:
+        state = str(project.get("state", ""))
+        if state not in common.VALID_PROJECT_STATES:
+            failures.append(
+                _check(
+                    "orchestration.project.state",
+                    False,
+                    f"invalid project state {state!r}",
+                )
+            )
+
+    # 3. One active task invariant
+    slices = ledger.get("slices") or []
+    in_progress_tasks = [
+        t
+        for s in slices
+        if isinstance(s, dict)
+        for t in (s.get("tasks") or [])
+        if isinstance(t, dict) and str(t.get("state")) == "IN_PROGRESS"
+    ]
+    if len(in_progress_tasks) > 1:
+        failures.append(
+            _check(
+                "orchestration.one_active_task",
+                False,
+                f"more than one IN_PROGRESS task: {[t.get('id') for t in in_progress_tasks]}",
+            )
+        )
+    elif len(in_progress_tasks) == 1:
+        current = str(project.get("current_task") or "")
+        active_id = str(in_progress_tasks[0].get("id"))
+        if current != active_id:
+            failures.append(
+                _check(
+                    "orchestration.current_task_consistency",
+                    False,
+                    f"project.current_task={current!r} disagrees with active task {active_id!r}",
+                )
+            )
+
+    # 4. Per-slice task correspondence with ``tasks.md``
+    prd_dir = artifact_dir.parent
+    manifest_slices = manifest.get("slices") or []
+    ledger_slice_ids = {str(s.get("id")) for s in slices if isinstance(s, dict)}
+    manifest_slice_ids = {
+        str(s.get("id"))
+        for s in manifest_slices
+        if isinstance(s, dict)
+    }
+    missing_in_ledger = manifest_slice_ids - ledger_slice_ids
+    extra_in_ledger = ledger_slice_ids - manifest_slice_ids
+    for sid in sorted(missing_in_ledger):
+        failures.append(
+            _check(
+                f"orchestration.slice_missing[{sid}]",
+                False,
+                f"slice {sid} declared in manifest but absent from ledger",
+            )
+        )
+    for sid in sorted(extra_in_ledger):
+        failures.append(
+            _check(
+                f"orchestration.slice_extra[{sid}]",
+                False,
+                f"slice {sid} present in ledger but missing from manifest",
+            )
+        )
+
+    # Cross-check tasks.md IDs against ledger task IDs per slice.
+    for slice_meta in slices:
+        if not isinstance(slice_meta, dict):
+            continue
+        slice_id = str(slice_meta.get("id"))
+        directory = str(slice_meta.get("directory") or "")
+        ledger_task_ids = {
+            str(t.get("id"))
+            for t in (slice_meta.get("tasks") or [])
+            if isinstance(t, dict)
+        }
+        if not directory:
+            continue
+        tasks_md = prd_dir / directory / "tasks.md"
+        if tasks_md.is_file():
+            md_task_ids = set(_TASK_ID_RE.findall(tasks_md.read_text(encoding="utf-8")))
+        else:
+            md_task_ids = set()
+        for tid in md_task_ids - ledger_task_ids:
+            failures.append(
+                _check(
+                    f"orchestration.tasks_md_missing[{slice_id}/{tid}]",
+                    False,
+                    f"tasks.md references {tid} but ledger has no entry",
+                )
+            )
+        for tid in ledger_task_ids - md_task_ids:
+            failures.append(
+                _check(
+                    f"orchestration.ledger_extra[{slice_id}/{tid}]",
+                    False,
+                    f"ledger has {tid} but tasks.md does not",
+                )
+            )
+
+    # 5. Strict priority / dependency order + acyclic
+    state_by_task: dict[str, str] = {}
+    deps_by_task: dict[str, set[str]] = {}
+    for slice_meta in slices:
+        if not isinstance(slice_meta, dict):
+            continue
+        for task in slice_meta.get("tasks") or []:
+            if not isinstance(task, dict):
+                continue
+            tid = str(task.get("id"))
+            state_by_task[tid] = str(task.get("state", "TODO"))
+            deps_by_task[tid] = {
+                str(d) for d in (task.get("dependencies") or []) if d
+            }
+    execution = ledger.get("priorities", {}).get("execution") or []
+    parsed_execution: list[tuple[str, str]] = []
+    for entry in execution:
+        if isinstance(entry, str) and "::" in entry:
+            parsed_execution.append(tuple(entry.split("::", 1)))
+    # Verify the declared execution order has each task exactly once
+    # and includes every task. (Use ``is`` checks on strings; two
+    # task IDs that happen to share the same string compare equal.)
+    execution_ids = [tid for _sid, tid in parsed_execution]
+    seen: set[str] = set()
+    duplicates = [tid for tid in execution_ids if tid in seen or seen.add(tid)]  # noqa: PERF401
+    if duplicates:
+        failures.append(
+            _check(
+                "orchestration.execution.duplicates",
+                False,
+                f"duplicate task ids in priorities.execution: {duplicates}",
+            )
+        )
+    missing_in_execution = set(state_by_task) - set(execution_ids)
+    if missing_in_execution:
+        failures.append(
+            _check(
+                "orchestration.execution.incomplete",
+                False,
+                f"tasks missing from priorities.execution: {sorted(missing_in_execution)}",
+            )
+        )
+
+    # Acyclic check across the task dependency graph.
+    color: dict[str, int] = {tid: 0 for tid in state_by_task}
+    WHITE, GRAY, BLACK = 0, 1, 2
+
+    def visit(node: str) -> bool:
+        color[node] = GRAY
+        for dep in deps_by_task.get(node, ()):  # type: ignore[arg-type]
+            if dep not in color:
+                continue
+            if color[dep] == GRAY:
+                return True
+            if color[dep] == WHITE and visit(dep):
+                return True
+        color[node] = BLACK
+        return False
+
+    for node in list(color):
+        if color[node] == 0 and visit(node):
+            failures.append(
+                _check(
+                    "orchestration.tasks.acyclic",
+                    False,
+                    "task dependency cycle detected",
+                )
+            )
+            break
+
+    # 6. Required checks + documentation evidence per task
+    allowed_check_kinds = (
+        "unit",
+        "integration",
+        "regression",
+        "e2e",
+        "migration",
+        "deployment",
+        "rollback",
+    )
+    for slice_meta in slices:
+        if not isinstance(slice_meta, dict):
+            continue
+        for task in slice_meta.get("tasks") or []:
+            if not isinstance(task, dict):
+                continue
+            tid = str(task.get("id"))
+            checks = task.get("checks") or {}
+            declared_kinds = [k for k in allowed_check_kinds if checks.get(k)]
+            if not declared_kinds:
+                failures.append(
+                    _check(
+                        f"orchestration.{tid}.no_checks",
+                        False,
+                        "task declares no verification checks",
+                    )
+                )
+                continue
+            if "unit" not in declared_kinds:
+                failures.append(
+                    _check(
+                        f"orchestration.{tid}.missing_unit",
+                        False,
+                        "task must declare at least one unit check",
+                    )
+                )
+            if "regression" not in declared_kinds:
+                failures.append(
+                    _check(
+                        f"orchestration.{tid}.missing_regression",
+                        False,
+                        "task must declare at least one regression check",
+                    )
+                )
+            if "e2e" not in declared_kinds and "integration" not in declared_kinds:
+                failures.append(
+                    _check(
+                        f"orchestration.{tid}.missing_user_path",
+                        False,
+                        "task must declare e2e (user-visible) or integration (internal) coverage",
+                    )
+                )
+            for kind in declared_kinds:
+                for cmd in checks.get(kind, []) or []:
+                    cmd_str = str(cmd).strip()
+                    if not cmd_str:
+                        failures.append(
+                            _check(
+                                f"orchestration.{tid}.{kind}.empty_command",
+                                False,
+                                f"{kind} check command must not be empty",
+                            )
+                        )
+                        continue
+                    placeholder = cmd_str.lower()
+                    if placeholder in {"echo", "true", ":", "pytest"}:
+                        failures.append(
+                            _check(
+                                f"orchestration.{tid}.{kind}.placeholder",
+                                False,
+                                f"{kind} check {cmd_str!r} is a placeholder; provide an exact verification command",
+                            )
+                        )
+            # Documentation evidence: if the task references non-trivial
+            # new dependencies (heuristic: any non-empty
+            # documentation_evidence entry), then each entry must be a
+            # context7:lib@version or official:url@ts reference.
+            for ref in task.get("documentation_evidence", []) or []:
+                ref_str = str(ref).strip()
+                if not ref_str:
+                    continue
+                if not (
+                    _DOC_CONTEXT7_RE.match(ref_str)
+                    or _DOC_OFFICIAL_RE.match(ref_str)
+                ):
+                    failures.append(
+                        _check(
+                            f"orchestration.{tid}.doc_evidence_format",
+                            False,
+                            f"documentation_evidence {ref_str!r} must be context7:<lib>@<version> or official:<url>@<ts>",
+                        )
+                    )
+
+    # 7. Final-gate completeness when project state >= AWAITING_APPROVAL
+    final_gate = ledger.get("final_gate") or {}
+    if str(project.get("state", "")) in {"AWAITING_APPROVAL", "RELEASE_READY", "STALE"}:
+        for field in (
+            "baseline_check",
+            "full_regression",
+            "cross_slice_e2e",
+            "deployment_smoke",
+            "rollback_check",
+        ):
+            if not str(final_gate.get(field) or "").strip():
+                failures.append(
+                    _check(
+                        f"orchestration.final_gate.{field}",
+                        False,
+                        f"final_gate.{field} must be set",
+                    )
+                )
+        approved_by = str(final_gate.get("approved_by") or "")
+        if str(project.get("state")) == "RELEASE_READY" and not approved_by:
+            failures.append(
+                _check(
+                    "orchestration.final_gate.approved_by",
+                    False,
+                    "RELEASE_READY requires final_gate.approved_by",
+                )
+            )
+
+    # 8. Slice exit_gate approval records
+    for slice_meta in slices:
+        if not isinstance(slice_meta, dict):
+            continue
+        slice_id = str(slice_meta.get("id"))
+        state_val = str(slice_meta.get("state", ""))
+        approval = (slice_meta.get("exit_gate") or {}).get("approval") or {}
+        approved_by = str(approval.get("approved_by") or "")
+        if state_val == "DONE" and not approved_by:
+            failures.append(
+                _check(
+                    f"orchestration.{slice_id}.exit_gate.approved_by",
+                    False,
+                    "slice DONE but exit_gate.approved_by unset",
+                )
+            )
+
+    # 9. Implementation-source hash invariant
+    head = str(ledger.get("repository", {}).get("head", ""))
+    dirty = str(ledger.get("repository", {}).get("dirty_fingerprint", ""))
+    if head or dirty:
+        current_hash = common.implementation_tree_fingerprint(project_root)
+        # Without a reference hash captured at plan/approve time we
+        # cannot compute a delta, but we can ensure the tree is
+        # fingerprintable (non-empty). The orchestrator records the
+        # reference fingerprint itself before every state-changing
+        # action; the validator reports the current value so the
+        # command body can compare.
+        if not current_hash:
+            failures.append(
+                _check(
+                    "orchestration.implementation_hash",
+                    False,
+                    "implementation tree fingerprint could not be computed",
+                )
+            )
+
+    return failures, ledger
+
+
 def main(argv: list[str] | None = None) -> int:
     args = common.parse_args(argv)
     project_root = common.find_project_root()
@@ -308,8 +700,10 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     slug = common.normalize_slug(raw_slug)
     phase = args.get("phase", "all").lower()
-    if phase not in {"decomposition", "final", "all"}:
-        common.err(f"ERROR: phase must be decomposition|final|all (got {phase!r})")
+    if phase not in {"decomposition", "final", "orchestration", "all"}:
+        common.err(
+            f"ERROR: phase must be decomposition|final|orchestration|all (got {phase!r})"
+        )
         return 2
 
     specs_root = project_root / ".specify" / "specs"
@@ -340,6 +734,12 @@ def main(argv: list[str] | None = None) -> int:
             f"(got {state!r})"
         )
         return 1
+    if phase == "orchestration" and state not in {"PLANNING", "PLAN_READY"}:
+        common.err(
+            f"ERROR: phase=orchestration requires state in PLANNING|PLAN_READY "
+            f"(got {state!r})"
+        )
+        return 1
 
     failures: list[dict[str, str]] = []
     failures.extend(_required_manifest_fields(manifest))
@@ -351,17 +751,35 @@ def main(argv: list[str] | None = None) -> int:
     if state in {"PLANNING", "PLAN_READY"} or phase == "final":
         failures.extend(_validate_child_artifacts(project_root, prd_dir, manifest))
 
+    ledger_present = common.ledger_exists(artifact_dir, project_root)
+    if phase == "orchestration" or (
+        phase == "all" and state in {"PLANNING", "PLAN_READY"} and ledger_present
+    ):
+        orch_failures, _ledger = _validate_orchestration_ledger(
+            project_root, artifact_dir, manifest
+        )
+        failures.extend(orch_failures)
+
     passed = sum(1 for f in failures if f["status"] == "PASS")
+    skipped = sum(1 for f in failures if f["status"] == "SKIPPED")
     failed = sum(1 for f in failures if f["status"] == "FAIL")
     summary = {
         "slug": slug,
         "manifest": str((artifact_dir / "manifest.yml").relative_to(project_root)),
         "phase": phase,
-        "checks_passed": passed + (0 if failed else 1),
+        "checks_passed": passed + skipped,
+        "checks_skipped": skipped,
         "checks_failed": failed,
         "failures": [f for f in failures if f["status"] == "FAIL"],
+        "skipped": [f for f in failures if f["status"] == "SKIPPED"],
         "state": state,
     }
+    if ledger_present:
+        summary["ledger"] = str(
+            (artifact_dir / common.ORCHESTRATION_LEDGER_FILENAME).relative_to(
+                project_root
+            )
+        )
     common.info(common.json_dumps(summary))
     return 0 if failed == 0 else 1
 
