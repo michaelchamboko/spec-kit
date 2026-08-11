@@ -1426,6 +1426,8 @@ class TestPrdOrchestrateImplementationInvariant:
             self._make_task(t5, 5, "READY"),
             self._make_task(t6, 6, "TODO"),
         ]
+        slice_meta["tasks"][1]["completed_at"] = "2026-08-10T14:19:47Z"
+        slice_meta["tasks"][3]["completed_at"] = "2026-08-10T14:20:00Z"
         ledger["priorities"]["execution"] = [
             f"SLC-001::{t0}", f"SLC-001::{t1}", f"SLC-001::{t2}",
             f"SLC-001::{t3}", f"SLC-001::{t4}", f"SLC-001::{t5}",
@@ -1456,12 +1458,14 @@ class TestPrdOrchestrateImplementationInvariant:
         assert tasks[t1]["state"] == "STALE"  # reopened target
         assert tasks[t1]["evidence"] == []
         assert tasks[t1]["active_owner"] is None
+        assert tasks[t1].get("completed_at") is None
         assert tasks[t2]["state"] == "STALE"  # later materialized task invalidated
         assert tasks[t2]["evidence"] == []
         assert tasks[t2]["active_owner"] is None
         assert tasks[t3]["state"] == "STALE"  # later completed task invalidated
         assert tasks[t3]["evidence"] == []
         assert tasks[t3]["active_owner"] is None
+        assert tasks[t3].get("completed_at") is None
         assert tasks[t4]["state"] == "STALE"  # later blocked task invalidated
         assert tasks[t4]["evidence"] == []
         assert tasks[t4]["active_owner"] is None

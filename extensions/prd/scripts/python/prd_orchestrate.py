@@ -848,6 +848,7 @@ def action_reopen(
             task_inner["state"] = "STALE"
             task_inner["evidence"] = []
             task_inner["active_owner"] = None
+            task_inner.pop("completed_at", None)
             task_inner.setdefault("reopens", []).append(
                 {"reason": reason, "by": task_id, "recorded_at": _utc_now_iso()}
             )
