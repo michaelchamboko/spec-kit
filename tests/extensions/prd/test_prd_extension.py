@@ -1084,6 +1084,11 @@ class TestPrdOrchestrateActionGuardrails:
 
     def test_evidence_path_must_exist(self):
         r = _run_orchestrate(
+            self.env, "slug=demo", "action=start",
+            "task=SLC-001-T001", "owner=alice",
+        )
+        assert r.returncode == 0, r.stderr
+        r = _run_orchestrate(
             self.env, "slug=demo", "action=evidence",
             "task=SLC-001-T001", "check=unit.main",
             "result=pass", "path=does/not/exist.py",
@@ -1131,6 +1136,10 @@ class TestPrdOrchestrateActionGuardrails:
 
 
 class TestPrdOrchestrateImplementationInvariant:
+    """Implementation may change freely while a task is IN_PROGRESS;
+    each pass-evidence entry binds the tree it proves, and completion
+    requires a current-tree pass for every declared check kind."""
+
     @pytest.fixture(autouse=True)
     def project(self, tmp_path, monkeypatch):
         for k in [k for k in os.environ if k.startswith("SPECIFY_")]:
@@ -1142,15 +1151,91 @@ class TestPrdOrchestrateImplementationInvariant:
         _author_workspace(tmp_path)
         _run_orchestrate(self.env, "slug=demo", "action=initialize")
 
-    def test_orchestrator_refuses_after_implementation_change(self):
+    def _read_ledger(self):
+        return yaml.safe_load(
+            (self.tmp / ".specify/specs/demo/000-spec-of-specs/orchestration.yml").read_text(
+                encoding="utf-8"
+            )
+        )
+
+    def _declare_checks(self):
+        commands = {
+            "unit": ["pytest tests/unit/test_x.py"],
+            "regression": ["pytest tests/regression/test_x.py"],
+            "e2e": ["bash scripts/e2e/x.sh"],
+        }
+        ledger = self._read_ledger()
+        ledger["slices"][0]["tasks"][0]["checks"] = {
+            k: list(commands.get(k, []))
+            for k in (
+                "unit", "integration", "regression", "e2e",
+                "migration", "deployment", "rollback",
+            )
+        }
+        (self.tmp / ".specify/specs/demo/000-spec-of-specs/orchestration.yml").write_text(
+            yaml.safe_dump(ledger), encoding="utf-8"
+        )
+
+    def _start(self):
         r = _run_orchestrate(
             self.env, "slug=demo", "action=start",
             "task=SLC-001-T001", "owner=alice",
         )
-        assert r.returncode == 0
-        new_dir = self.tmp / "src" / "feature"
-        new_dir.mkdir(parents=True)
-        (new_dir / "main.py").write_text("# new\n", encoding="utf-8")
+        assert r.returncode == 0, r.stderr
+
+    def _record_pass_evidence(self, kinds=("unit", "regression", "e2e")):
+        for kind in kinds:
+            r = _run_orchestrate(
+                self.env, "slug=demo", "action=evidence",
+                "task=SLC-001-T001", f"check={kind}.main",
+                "result=pass", "path=README.md",
+            )
+            assert r.returncode == 0, r.stdout
+
+    def _add_implementation_file(self, name="main.py"):
+        src = self.tmp / "src" / "feature"
+        src.mkdir(parents=True)
+        (src / name).write_text("# new\n", encoding="utf-8")
+
+    def test_normal_start_implement_evidence_complete_succeeds(self):
+        self._declare_checks()
+        self._start()
+        self._add_implementation_file()
+        self._record_pass_evidence()
+        r = _run_orchestrate(
+            self.env, "slug=demo", "action=complete",
+            "task=SLC-001-T001",
+        )
+        assert r.returncode == 0, r.stdout
+        body = json.loads(r.stdout)
+        assert body["slice_done"] is True
+        assert body["project_state"] == "AWAITING_APPROVAL"
+
+    def test_pass_evidence_binds_current_implementation_fingerprint(self):
+        self._declare_checks()
+        self._start()
+        self._add_implementation_file()
+        self._record_pass_evidence()
+        ledger = self._read_ledger()
+        reference = ledger["repository"]["implementation_fingerprint"]
+        task = ledger["slices"][0]["tasks"][0]
+        assert task["state"] == "IN_PROGRESS"
+        entries = task["evidence"]
+        assert {e["check_kind"] for e in entries} == {"unit", "regression", "e2e"}
+        for entry in entries:
+            assert entry["implementation_fingerprint"] == reference
+
+    def test_recording_evidence_does_not_poison_completion(self):
+        self._declare_checks()
+        self._start()
+        self._record_pass_evidence()
+        r = _run_orchestrate(
+            self.env, "slug=demo", "action=complete",
+            "task=SLC-001-T001",
+        )
+        assert r.returncode == 0, r.stdout
+
+    def test_evidence_rejects_task_not_in_progress(self):
         r = _run_orchestrate(
             self.env, "slug=demo", "action=evidence",
             "task=SLC-001-T001", "check=unit.main",
@@ -1158,8 +1243,132 @@ class TestPrdOrchestrateImplementationInvariant:
         )
         assert r.returncode == 1
         body = json.loads(r.stdout)
-        assert body["reason"] == "implementation_hash_changed"
-        assert "Halt" in body["recovery"]
+        assert body["reason"] == "task_not_in_progress"
+
+    def test_evidence_rejects_second_task_while_another_is_active(self):
+        self._start()
+        ledger = self._read_ledger()
+        ledger["slices"][0]["tasks"].append({
+            "id": "SLC-001-T002",
+            "rank": 2,
+            "state": "TODO",
+            "requirements": [],
+            "acceptance": [],
+            "interfaces": [],
+            "documentation_evidence": [],
+            "checks": {
+                "unit": [], "integration": [], "regression": [],
+                "e2e": [], "migration": [], "deployment": [], "rollback": [],
+            },
+            "evidence": [],
+            "blockers": [],
+        })
+        (self.tmp / ".specify/specs/demo/000-spec-of-specs/orchestration.yml").write_text(
+            yaml.safe_dump(ledger), encoding="utf-8"
+        )
+        r = _run_orchestrate(
+            self.env, "slug=demo", "action=evidence",
+            "task=SLC-001-T002", "check=unit.main",
+            "result=pass", "path=README.md",
+        )
+        assert r.returncode == 1
+        body = json.loads(r.stdout)
+        assert body["reason"] == "task_not_in_progress"
+
+    @pytest.mark.parametrize("mutation", ["add", "change", "delete"])
+    def test_post_evidence_source_change_blocks_completion_until_rerecorded(self, mutation):
+        self._declare_checks()
+        self._start()
+        self._add_implementation_file()
+        self._record_pass_evidence()
+        target = self.tmp / "src" / "feature" / "main.py"
+        if mutation == "add":
+            (self.tmp / "src" / "feature" / "extra.py").write_text(
+                "# extra\n", encoding="utf-8"
+            )
+        elif mutation == "change":
+            with target.open("a", encoding="utf-8") as fh:
+                fh.write("# changed\n")
+        elif mutation == "delete":
+            target.unlink()
+        r = _run_orchestrate(
+            self.env, "slug=demo", "action=complete",
+            "task=SLC-001-T001",
+        )
+        assert r.returncode == 1
+        body = json.loads(r.stdout)
+        assert body["reason"] == "evidence_stale"
+        assert set(body["stale"]) == {"unit", "regression", "e2e"}
+        self._record_pass_evidence()
+        r = _run_orchestrate(
+            self.env, "slug=demo", "action=complete",
+            "task=SLC-001-T001",
+        )
+        assert r.returncode == 0, r.stdout
+
+    def test_complete_without_evidence_still_blocked(self):
+        self._declare_checks()
+        self._start()
+        r = _run_orchestrate(
+            self.env, "slug=demo", "action=complete",
+            "task=SLC-001-T001",
+        )
+        assert r.returncode == 1
+        body = json.loads(r.stdout)
+        assert body["reason"] == "missing_evidence"
+
+    def test_partial_evidence_still_blocked(self):
+        self._declare_checks()
+        self._start()
+        self._record_pass_evidence(kinds=("unit",))
+        r = _run_orchestrate(
+            self.env, "slug=demo", "action=complete",
+            "task=SLC-001-T001",
+        )
+        assert r.returncode == 1
+        body = json.loads(r.stdout)
+        assert body["reason"] == "missing_evidence"
+        missing = [k for k, _ in body["missing"]]
+        assert set(missing) == {"regression", "e2e"}
+
+    def test_reopen_after_drift_clears_evidence_and_refreshes_reference(self):
+        self._declare_checks()
+        self._start()
+        self._add_implementation_file()
+        self._record_pass_evidence()
+        stale_reference = self._read_ledger()["repository"]["implementation_fingerprint"]
+        target = self.tmp / "src" / "feature" / "main.py"
+        with target.open("a", encoding="utf-8") as fh:
+            fh.write("# invalidated\n")
+        r = _run_orchestrate(
+            self.env, "slug=demo", "action=reopen",
+            "task=SLC-001-T001", "reason=implementation drifted",
+        )
+        assert r.returncode == 0, r.stdout
+        ledger = self._read_ledger()
+        task = ledger["slices"][0]["tasks"][0]
+        assert task["state"] == "STALE"
+        assert task["evidence"] == []
+        refreshed = ledger["repository"]["implementation_fingerprint"]
+        assert refreshed != stale_reference
+        r = _run_orchestrate(
+            self.env, "slug=demo", "action=start",
+            "task=SLC-001-T001", "owner=alice",
+        )
+        assert r.returncode == 0, r.stdout
+        r = _run_orchestrate(
+            self.env, "slug=demo", "action=complete",
+            "task=SLC-001-T001",
+        )
+        assert r.returncode == 1
+        body = json.loads(r.stdout)
+        assert body["reason"] == "missing_evidence"
+        self._record_pass_evidence()
+        r = _run_orchestrate(
+            self.env, "slug=demo", "action=complete",
+            "task=SLC-001-T001",
+        )
+        assert r.returncode == 0, r.stdout
 
 
 # ── Python twin: orchestration-phase validation ────────────────────
