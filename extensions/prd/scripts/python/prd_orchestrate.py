@@ -15,7 +15,10 @@ re-recorded. Transitions outside implementation (``start``/``block``/
 the last evidenced tree. ``reopen`` is the sanctioned recovery path: it
 clears stale evidence, marks the task STALE, and re-baselines the
 reference to the current tree, so drifted work restarts with a fresh
-start/evidence/complete cycle instead of manual ledger edits.
+start/evidence/complete cycle instead of manual ledger edits. Reopen
+invalidates explicit transitive dependents plus any later tasks in the
+frozen execution order that already hold a result (IN_PROGRESS/DONE/
+BLOCKED); READY/TODO tasks stay planned and nothing earlier is touched.
 
 Action surface:
 
@@ -808,6 +811,27 @@ def action_reopen(
         closure.add(current)
         stack.extend(dependents.get(current, []))
 
+    # Forward execution-order fallback: when explicit task dependencies
+    # are absent (or incomplete), any later task in the frozen plan
+    # order that already holds a result -- IN_PROGRESS, DONE, or BLOCKED
+    # -- is also invalidated, so reopening the target cannot strand an
+    # active downstream task. READY/TODO tasks carry no result and stay
+    # planned; nothing earlier in the order is touched.
+    execution = ledger.get("priorities", {}).get("execution", []) or []
+    seen_target = False
+    for entry in execution:
+        if not isinstance(entry, str) or "::" not in entry:
+            continue
+        _slice_id, later_id = entry.split("::", 1)
+        if not seen_target:
+            if later_id == task_id:
+                seen_target = True
+            continue
+        if later_id in closure:
+            continue
+        if state_by_task.get(later_id) in {"IN_PROGRESS", "DONE", "BLOCKED"}:
+            closure.add(later_id)
+
     lock = common.acquire_ledger_lock(artifact_dir, project_root)
     try:
         # Reopen is the sanctioned recovery path for drifted trees; it
@@ -815,19 +839,20 @@ def action_reopen(
         # current (unverified) tree so a fresh start/evidence/complete
         # cycle can run without manual ledger edits.
         _set_ledger_reference_fingerprint(ledger, project_root)
-        # Invalidate the target and downstream.
+        # Invalidate the target and all downstream work: explicit
+        # dependents plus later tasks materialized in the frozen order.
         for tid in closure:
             slice_inner, task_inner = _task_by_id(ledger, tid)
             if task_inner is None:
                 continue
             task_inner["state"] = "STALE"
             task_inner["evidence"] = []
+            task_inner["active_owner"] = None
             task_inner.setdefault("reopens", []).append(
                 {"reason": reason, "by": task_id, "recorded_at": _utc_now_iso()}
             )
         # Invalidate downstream approvals and any slice whose tasks
         # became STALE.
-        affected_slices = {s.get("id") for s in ledger.get("slices", []) or []}
         for slice_meta_inner in ledger.get("slices", []) or []:
             contains_stale = any(
                 str(t.get("state")) == "STALE"
@@ -854,9 +879,6 @@ def action_reopen(
         if final_gate.get("approved_by"):
             final_gate["approved_by"] = None
             final_gate["approved_at"] = None
-        # Unused linter-clean: ``affected_slices`` is computed for the
-        # future when we surface the invalidation in status output.
-        del affected_slices
         common.bump_revision(ledger)
         common.write_ledger(artifact_dir, project_root, ledger)
     finally:

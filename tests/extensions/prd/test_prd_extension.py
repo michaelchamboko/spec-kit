@@ -1370,6 +1370,160 @@ class TestPrdOrchestrateImplementationInvariant:
         )
         assert r.returncode == 0, r.stdout
 
+    def _write_ledger(self, ledger):
+        (self.tmp / ".specify/specs/demo/000-spec-of-specs/orchestration.yml").write_text(
+            yaml.safe_dump(ledger), encoding="utf-8"
+        )
+
+    def _make_task(self, task_id, rank, state, *, deps=(), owner=None, checks=(), evidence=()):
+        return {
+            "id": task_id,
+            "rank": rank,
+            "state": state,
+            "requirements": [],
+            "acceptance": [],
+            "interfaces": [],
+            "documentation_evidence": [],
+            "checks": {
+                "unit": ["pytest tests/unit/test_x.py"] if "unit" in checks else [],
+                "integration": [],
+                "regression": ["pytest tests/regression/test_x.py"] if "regression" in checks else [],
+                "e2e": ["bash scripts/e2e/x.sh"] if "e2e" in checks else [],
+                "migration": [],
+                "deployment": [],
+                "rollback": [],
+            },
+            "evidence": list(evidence),
+            "blockers": [],
+            "dependencies": list(deps),
+            "active_owner": owner,
+        }
+
+    def test_reopen_without_dependencies_invalidates_later_materialized_tasks(self):
+        """Wawi-shaped chain (no task dependencies): reopening a completed
+        task stales later materialized tasks, clears their evidence and
+        owners, and leaves earlier and unstarted work untouched."""
+        self._start()
+        ledger = self._read_ledger()
+        slice_meta = ledger["slices"][0]
+        t0, t1, t2, t3, t4, t5, t6 = (
+            "SLC-001-T000",
+            "SLC-001-T001",
+            "SLC-001-T002",
+            "SLC-001-T003",
+            "SLC-001-T004",
+            "SLC-001-T005",
+            "SLC-001-T006",
+        )
+        proof = [{"check_kind": "unit", "check_id": "main", "result": "pass"}]
+        slice_meta["state"] = "IN_PROGRESS"
+        slice_meta["tasks"] = [
+            self._make_task(t0, 0, "DONE", evidence=proof),
+            self._make_task(t1, 1, "DONE", owner="alice", checks=("unit",), evidence=proof),
+            self._make_task(t2, 2, "IN_PROGRESS", owner="bob", evidence=proof),
+            self._make_task(t3, 3, "DONE", owner="carol", evidence=proof),
+            self._make_task(t4, 4, "BLOCKED", owner="dana", evidence=proof),
+            self._make_task(t5, 5, "READY"),
+            self._make_task(t6, 6, "TODO"),
+        ]
+        ledger["priorities"]["execution"] = [
+            f"SLC-001::{t0}", f"SLC-001::{t1}", f"SLC-001::{t2}",
+            f"SLC-001::{t3}", f"SLC-001::{t4}", f"SLC-001::{t5}",
+            f"SLC-001::{t6}",
+        ]
+        ledger["project"].update({"current_task": t2, "active_owner": "bob"})
+        stale_reference = ledger.get("repository", {}).get("implementation_fingerprint")
+        assert stale_reference
+        self._write_ledger(ledger)
+        self._add_implementation_file()
+
+        r = _run_orchestrate(
+            self.env, "slug=demo", "action=reopen",
+            "task=SLC-001-T001", "reason=implementation drifted",
+        )
+        assert r.returncode == 0, r.stdout
+        body = json.loads(r.stdout)
+        assert set(body["invalidated"]) == {
+            "SLC-001-T001",
+            "SLC-001-T002",
+            "SLC-001-T003",
+            "SLC-001-T004",
+        }
+
+        ledger = self._read_ledger()
+        tasks = {t["id"]: t for t in ledger["slices"][0]["tasks"]}
+        assert tasks[t0]["state"] == "DONE"  # earlier materialized task untouched
+        assert tasks[t1]["state"] == "STALE"  # reopened target
+        assert tasks[t1]["evidence"] == []
+        assert tasks[t1]["active_owner"] is None
+        assert tasks[t2]["state"] == "STALE"  # later materialized task invalidated
+        assert tasks[t2]["evidence"] == []
+        assert tasks[t2]["active_owner"] is None
+        assert tasks[t3]["state"] == "STALE"  # later completed task invalidated
+        assert tasks[t3]["evidence"] == []
+        assert tasks[t3]["active_owner"] is None
+        assert tasks[t4]["state"] == "STALE"  # later blocked task invalidated
+        assert tasks[t4]["evidence"] == []
+        assert tasks[t4]["active_owner"] is None
+        assert tasks[t5]["state"] == "READY"  # unstarted task stays planned
+        assert tasks[t6]["state"] == "TODO"  # later todo task stays planned
+        assert ledger["project"]["current_task"] is None
+        assert ledger["project"]["active_owner"] is None
+        assert ledger["repository"]["implementation_fingerprint"] != stale_reference
+        assert not any(
+            t["state"] == "IN_PROGRESS"
+            for t in ledger["slices"][0]["tasks"]
+        )
+
+        # Next eligible task is the reopened T001.
+        r = _run_orchestrate(self.env, "slug=demo", "action=next")
+        assert r.returncode == 0, r.stdout
+        assert json.loads(r.stdout)["task"]["id"] == "SLC-001-T001"
+
+        # Fresh evidence is still mandatory before completion.
+        r = _run_orchestrate(
+            self.env, "slug=demo", "action=start",
+            "task=SLC-001-T001", "owner=alice",
+        )
+        assert r.returncode == 0, r.stdout
+        r = _run_orchestrate(
+            self.env, "slug=demo", "action=complete",
+            "task=SLC-001-T001",
+        )
+        assert r.returncode == 1
+        assert json.loads(r.stdout)["reason"] == "missing_evidence"
+
+    def test_reopen_preserves_explicit_transitive_dependency_invalidation(self):
+        """Explicit task dependencies still invalidate transitively."""
+        ledger = self._read_ledger()
+        slice_meta = ledger["slices"][0]
+        t1, t2, t3 = ("SLC-001-T001", "SLC-001-T002", "SLC-001-T003")
+        proof = [{"check_kind": "unit", "check_id": "main", "result": "pass"}]
+        slice_meta["tasks"] = [
+            self._make_task(t1, 1, "DONE", owner="alice", checks=("unit",), evidence=proof),
+            self._make_task(t2, 2, "DONE", deps=(t1,), owner="bob", evidence=proof),
+            self._make_task(t3, 3, "DONE", deps=(t2,), evidence=proof),
+        ]
+        ledger["priorities"]["execution"] = [
+            f"SLC-001::{t1}", f"SLC-001::{t2}", f"SLC-001::{t3}",
+        ]
+        ledger["project"]["current_task"] = None
+        self._write_ledger(ledger)
+
+        r = _run_orchestrate(
+            self.env, "slug=demo", "action=reopen",
+            "task=SLC-001-T001", "reason=implementation drifted",
+        )
+        assert r.returncode == 0, r.stdout
+        ledger = self._read_ledger()
+        tasks = {t["id"]: t for t in ledger["slices"][0]["tasks"]}
+        for tid in (t1, t2, t3):
+            assert tasks[tid]["state"] == "STALE"
+            assert tasks[tid]["evidence"] == []
+            assert tasks[tid]["active_owner"] is None
+        assert ledger["project"]["current_task"] is None
+        assert ledger["project"]["active_owner"] is None
+
 
 # ── Python twin: orchestration-phase validation ────────────────────
 
