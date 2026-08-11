@@ -74,8 +74,11 @@ Resolve project root and real, symlink-resolved path of `PRD_DIR/` and every art
    - Artifact_state valid enum
 
 2. **Source Integrity**
-   - `source/prd-v<active_version>.normalized.md` exists
-   - Source digest in manifest matches SHA-256 of normalized file
+   - `source/prd-v<active_version>.normalized.md` exists, unless
+     `source.canonical_path` exactly equals `source.preserved_at` (the
+     preserved root PRD is then the canonical source and no derivative is
+     required)
+   - Source digest in manifest matches SHA-256 of the preserved source
    - Original source preserved at `source/prd-v<active_version>.<ext>`
 
 3. **Requirements Traceability**

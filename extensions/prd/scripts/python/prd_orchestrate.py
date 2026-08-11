@@ -3,9 +3,22 @@
 
 Invoked by ``speckit.prd.orchestrate``. Reads, mutates, and atomically
 rewrites the ``orchestration.yml`` ledger; never edits implementation
-source code. The implementation-source-hash invariant is checked before
-and after every state-changing action — any change is reported as a
-fatal integrity violation.
+source code.
+
+Implementation-drift policy: implementation files may change freely while
+a task is IN_PROGRESS. Every pass-evidence entry binds the
+implementation-tree fingerprint current when it was recorded; ``complete``
+requires a pass bound to the *current* tree for every declared check kind,
+so post-evidence source changes block completion until evidence is
+re-recorded. Transitions outside implementation (``start``/``block``/
+``approve``) remain fail-closed against unrecorded drift relative to
+the last evidenced tree. ``reopen`` is the sanctioned recovery path: it
+clears stale evidence, marks the task STALE, and re-baselines the
+reference to the current tree, so drifted work restarts with a fresh
+start/evidence/complete cycle instead of manual ledger edits. Reopen
+invalidates explicit transitive dependents plus any later tasks in the
+frozen execution order that already hold a result (IN_PROGRESS/DONE/
+BLOCKED); READY/TODO tasks stay planned and nothing earlier is touched.
 
 Action surface:
 
@@ -105,8 +118,12 @@ def _ok(**extra: Any) -> dict[str, Any]:
 
 
 def _next_eligible_task(ledger: dict[str, Any]) -> dict[str, Any] | None:
-    """Return the first task whose state is TODO/READY and whose
+    """Return the first task whose state is TODO/READY/STALE and whose
     dependencies are all DONE (transitively).
+
+    STALE tasks are eligible so ``reopen`` (the sanctioned recovery path)
+    can be restarted with a fresh start/evidence/complete cycle against
+    the re-baselined tree.
 
     Walks the frozen execution order; returns the first match or
     ``None`` if nothing is eligible.
@@ -121,7 +138,7 @@ def _next_eligible_task(ledger: dict[str, Any]) -> dict[str, Any] | None:
             continue
         _slice_id, task_id = entry.split("::", 1)
         state = state_by_task.get(task_id)
-        if state not in {"TODO", "READY"}:
+        if state not in {"TODO", "READY", "STALE"}:
             continue
         task = next(
             (
@@ -182,11 +199,12 @@ def _ledger_reference_fingerprint(ledger: dict[str, Any]) -> str | None:
     """Return the ledger's stored implementation-tree reference hash, or
     ``None`` if the ledger predates the invariant.
 
-    The reference is captured the first time the orchestrator writes
-    a state-changing action and reused for every subsequent invariant
-    check. This makes the invariant a true before/after detector even
-    when the host process's view of the filesystem changes between
-    successive subprocess invocations.
+    The reference is captured by ``start`` and refreshed by every
+    ``evidence`` action, so it tracks the last tree the ledger has seen
+    as stable. ``block``/``approve`` reject on any difference from this
+    reference (unrecorded drift); ``complete`` instead requires evidence
+    bound to the *current* tree. ``reopen`` re-baselines the reference
+    to the current tree as its recovery action.
     """
     repo = ledger.get("repository") or {}
     value = repo.get("implementation_fingerprint")
@@ -209,9 +227,13 @@ def _enforce_implementation_invariant(
 
     On the first call (no reference recorded yet), the current
     fingerprint is captured and stored so subsequent calls have a
-    stable baseline. After the first call, the invariant becomes a
-    true before/after detector: any implementation file change between
-    actions is fatal.
+    stable baseline. The reference is refreshed whenever ``evidence``
+    records a new proof, so this check only fires on *unrecorded* drift
+    for the transitions that still use it (``start``/``block``/
+    ``approve``). ``evidence`` and ``complete`` do not use this check:
+    evidence snapshots the tree, and completion compares evidence to the
+    current tree directly. ``reopen`` never rejects on drift; it clears
+    stale evidence and re-baselines the reference instead.
     """
     reference = _ledger_reference_fingerprint(ledger)
     current = _implementation_fingerprint(project_root)
@@ -503,6 +525,13 @@ def action_evidence(
     slice_meta, task = _task_by_id(ledger, task_id)
     if task is None or slice_meta is None:
         return _fail("unknown_task_id", f"No ledger task with id {task_id!r}.")
+    if str(task.get("state")) != "IN_PROGRESS":
+        return _fail(
+            "task_not_in_progress",
+            "Evidence can only be recorded for the current IN_PROGRESS task. "
+            "Use action=start first.",
+            task_state=str(task.get("state")),
+        )
 
     check_kind, _, check_id = check.partition(".")
     if not check_kind or not check_id:
@@ -525,9 +554,7 @@ def action_evidence(
             )
         source_path = candidate
 
-    violation = _enforce_implementation_invariant(project_root, ledger, "evidence")
-    if violation:
-        return violation
+    current_fp = _implementation_fingerprint(project_root)
 
     lock = common.acquire_ledger_lock(artifact_dir, project_root)
     try:
@@ -540,17 +567,22 @@ def action_evidence(
             result=result,
             source_path=source_path,
         )
-        # Append an evidence entry on the task.
+        # Append an evidence entry on the task, bound to the exact
+        # implementation tree it proves.
         entry: dict[str, Any] = {
             "check_kind": check_kind,
             "check_id": check_id,
             "result": result,
             "recorded_at": _utc_now_iso(),
             "evidence_path": str(evidence_path.relative_to(project_root)),
+            "implementation_fingerprint": current_fp,
         }
         if source_path is not None:
             entry["source_path"] = str(source_path.relative_to(project_root))
         task.setdefault("evidence", []).append(entry)
+        # Refresh the ledger's reference so non-implementation
+        # transitions (block/reopen/approve) treat this tree as stable.
+        ledger.setdefault("repository", {})["implementation_fingerprint"] = current_fp
         common.bump_revision(ledger)
         common.write_ledger(artifact_dir, project_root, ledger)
     finally:
@@ -589,7 +621,11 @@ def action_complete(
             "task_not_in_progress",
             "Only the currently IN_PROGRESS task can be completed. Use action=start first if no task is active.",
         )
-    # Verify every declared check kind has at least one pass entry.
+    # Verify every declared check kind has a pass entry bound to the
+    # CURRENT implementation tree. Evidence recorded against an older
+    # tree (any post-evidence source change) is stale and blocks
+    # completion until re-recorded.
+    current_fp = _implementation_fingerprint(project_root)
     declared_kinds = [
         kind
         for kind, cmds in (task.get("checks") or {}).items()
@@ -601,23 +637,39 @@ def action_complete(
             "no_declared_checks",
             "Add at least one unit/regression/integration/e2e check to the task before completing.",
         )
-    evidence_by_kind: dict[str, dict[str, str]] = {}
+    pass_by_kind: dict[str, str] = {}
+    fresh_by_kind: dict[str, str] = {}
     for entry in task.get("evidence", []) or []:
         kind = str(entry.get("check_kind"))
         cid = str(entry.get("check_id"))
         result = str(entry.get("result"))
-        if kind in declared_kinds:
-            evidence_by_kind.setdefault(kind, {})[cid] = result
-    missing: list[tuple[str, str]] = []
+        if kind not in declared_kinds or result != "pass":
+            continue
+        pass_by_kind.setdefault(kind, cid)
+        if str(entry.get("implementation_fingerprint") or "") == current_fp:
+            fresh_by_kind.setdefault(kind, cid)
+    unsatisfied: list[tuple[str, str]] = []
     for kind in declared_kinds:
-        if not any(v == "pass" for v in evidence_by_kind.get(kind, {}).values()):
-            missing.append((kind, "no_pass_evidence"))
-    if missing:
+        if kind not in fresh_by_kind:
+            unsatisfied.append(
+                (kind, "evidence_stale" if kind in pass_by_kind else "no_pass_evidence")
+            )
+    if unsatisfied:
+        stale_kinds = [k for k, r in unsatisfied if r == "evidence_stale"]
+        if stale_kinds:
+            return _fail(
+                "evidence_stale",
+                "Implementation files changed after the recorded pass evidence. "
+                "Re-run the declared checks and re-record pass evidence against "
+                "the current tree before completing.",
+                stale=stale_kinds,
+                unsatisfied=unsatisfied,
+            )
         return _fail(
             "missing_evidence",
             "Record a pass evidence entry for each declared check kind: "
-            f"{[m[0] for m in missing]!r}.",
-            missing=missing,
+            f"{[k for k, _ in unsatisfied]!r}.",
+            missing=unsatisfied,
         )
 
     # Refuse any verification command that looks like a coding agent or
@@ -633,10 +685,6 @@ def action_complete(
                     "Replace it with a read-only verification command before completing.",
                     offending=cmd,
                 )
-
-    violation = _enforce_implementation_invariant(project_root, ledger, "complete")
-    if violation:
-        return violation
 
     lock = common.acquire_ledger_lock(artifact_dir, project_root)
     try:
@@ -763,25 +811,49 @@ def action_reopen(
         closure.add(current)
         stack.extend(dependents.get(current, []))
 
-    violation = _enforce_implementation_invariant(project_root, ledger, "reopen")
-    if violation:
-        return violation
+    # Forward execution-order fallback: when explicit task dependencies
+    # are absent (or incomplete), any later task in the frozen plan
+    # order that already holds a result -- IN_PROGRESS, DONE, or BLOCKED
+    # -- is also invalidated, so reopening the target cannot strand an
+    # active downstream task. READY/TODO tasks carry no result and stay
+    # planned; nothing earlier in the order is touched.
+    execution = ledger.get("priorities", {}).get("execution", []) or []
+    seen_target = False
+    for entry in execution:
+        if not isinstance(entry, str) or "::" not in entry:
+            continue
+        _slice_id, later_id = entry.split("::", 1)
+        if not seen_target:
+            if later_id == task_id:
+                seen_target = True
+            continue
+        if later_id in closure:
+            continue
+        if state_by_task.get(later_id) in {"IN_PROGRESS", "DONE", "BLOCKED"}:
+            closure.add(later_id)
 
     lock = common.acquire_ledger_lock(artifact_dir, project_root)
     try:
-        # Invalidate the target and downstream.
+        # Reopen is the sanctioned recovery path for drifted trees; it
+        # never rejects on drift. Re-baseline the reference to the
+        # current (unverified) tree so a fresh start/evidence/complete
+        # cycle can run without manual ledger edits.
+        _set_ledger_reference_fingerprint(ledger, project_root)
+        # Invalidate the target and all downstream work: explicit
+        # dependents plus later tasks materialized in the frozen order.
         for tid in closure:
             slice_inner, task_inner = _task_by_id(ledger, tid)
             if task_inner is None:
                 continue
             task_inner["state"] = "STALE"
             task_inner["evidence"] = []
+            task_inner["active_owner"] = None
+            task_inner.pop("completed_at", None)
             task_inner.setdefault("reopens", []).append(
                 {"reason": reason, "by": task_id, "recorded_at": _utc_now_iso()}
             )
         # Invalidate downstream approvals and any slice whose tasks
         # became STALE.
-        affected_slices = {s.get("id") for s in ledger.get("slices", []) or []}
         for slice_meta_inner in ledger.get("slices", []) or []:
             contains_stale = any(
                 str(t.get("state")) == "STALE"
@@ -808,9 +880,6 @@ def action_reopen(
         if final_gate.get("approved_by"):
             final_gate["approved_by"] = None
             final_gate["approved_at"] = None
-        # Unused linter-clean: ``affected_slices`` is computed for the
-        # future when we surface the invalidation in status output.
-        del affected_slices
         common.bump_revision(ledger)
         common.write_ledger(artifact_dir, project_root, ledger)
     finally:

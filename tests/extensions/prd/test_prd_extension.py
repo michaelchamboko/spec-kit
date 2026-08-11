@@ -16,7 +16,9 @@ Validates:
 from __future__ import annotations
 
 import json
+import hashlib
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -27,6 +29,12 @@ import yaml
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 EXT_DIR = PROJECT_ROOT / "extensions" / "prd"
+
+
+def _normalize_state_owned_values(text: str) -> str:
+    text = re.sub(r"^  implementation_fingerprint: .*$\n", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^\s+active_owner: .*$\n", "", text, flags=re.MULTILINE)
+    return re.sub(r"^updated_at: .*$", "updated_at: <state-owned>", text, flags=re.MULTILINE)
 
 EXPECTED_COMMANDS = {
     "speckit.prd.plan",
@@ -922,6 +930,77 @@ class TestPrdOrchestrateActionGuardrails:
         assert body["task"] is not None
         assert body["task"]["id"] == "SLC-001-T001"
 
+    def test_start_preserves_hand_authored_ledger_text(self):
+        ledger_path = self.tmp / ".specify/specs/demo/000-spec-of-specs/orchestration.yml"
+        before = ledger_path.read_text(encoding="utf-8")
+        before = "# operator-maintained ledger\n" + before.replace(
+            "project:\n", "project:\n  # retain this comment\n", 1
+        )
+        ledger_path.write_text(before, encoding="utf-8")
+
+        r = _run_orchestrate(
+            self.env, "slug=demo", "action=start",
+            "task=SLC-001-T001", "owner=alice",
+        )
+        assert r.returncode == 0, r.stderr
+
+        expected = before.replace("revision: 1\n", "revision: 2\n", 1)
+        expected = expected.replace("state: NOT_STARTED", "state: IN_PROGRESS", 1)
+        expected = expected.replace("current_task: null", "current_task: SLC-001-T001", 1)
+        expected = expected.replace("current_task:\n", "current_task: SLC-001-T001\n", 1)
+        expected = expected.replace("active_owner: null", "active_owner: alice")
+        expected = expected.replace("active_owner:\n", "active_owner: alice\n")
+        expected = expected.replace("state: TODO", "state: IN_PROGRESS", 1)
+        expected = expected.replace(
+            "      blockers: []\n", "      blockers: []\n      active_owner: alice\n", 1
+        )
+        assert _normalize_state_owned_values(ledger_path.read_text(encoding="utf-8")) == (
+            _normalize_state_owned_values(expected)
+        )
+
+    def test_block_preserves_hand_authored_ledger_text(self):
+        ledger_path = self.tmp / ".specify/specs/demo/000-spec-of-specs/orchestration.yml"
+        before = "# operator-maintained ledger\n" + ledger_path.read_text(encoding="utf-8")
+        ledger_path.write_text(before, encoding="utf-8")
+
+        r = _run_orchestrate(
+            self.env, "slug=demo", "action=block",
+            "task=SLC-001-T001", "reason=validator mismatch",
+        )
+        assert r.returncode == 0, r.stderr
+
+        after = ledger_path.read_text(encoding="utf-8")
+        assert after.split("repository:", 1)[0] == before.replace(
+            "revision: 1\n", "revision: 2\n", 1
+        ).split("repository:", 1)[0]
+        assert "# operator-maintained ledger" in after
+        assert "reason: validator mismatch" in after
+
+    @pytest.mark.skipif(
+        not (shutil.which("pwsh") or shutil.which("powershell.exe") or shutil.which("powershell")),
+        reason="pwsh/PowerShell not available",
+    )
+    def test_powershell_orchestrator_dispatches_to_python_twin(self):
+        pwsh = shutil.which("pwsh") or shutil.which("powershell.exe") or shutil.which("powershell")
+        r = subprocess.run(
+            [
+                pwsh,
+                "-NoProfile",
+                "-File",
+                str(EXT_DIR / "scripts" / "powershell" / "prd_orchestrate.ps1"),
+                "-Slug",
+                "demo",
+                "-Action",
+                "status",
+            ],
+            capture_output=True,
+            text=True,
+            env={**self.env, "SPECKIT_PYTHON": sys.executable},
+            timeout=30,
+        )
+        assert r.returncode == 0, r.stderr
+        assert json.loads(r.stdout)["action"] == "status"
+
     def test_start_then_start_another_rejected(self):
         r = _run_orchestrate(
             self.env, "slug=demo", "action=start",
@@ -1005,6 +1084,11 @@ class TestPrdOrchestrateActionGuardrails:
 
     def test_evidence_path_must_exist(self):
         r = _run_orchestrate(
+            self.env, "slug=demo", "action=start",
+            "task=SLC-001-T001", "owner=alice",
+        )
+        assert r.returncode == 0, r.stderr
+        r = _run_orchestrate(
             self.env, "slug=demo", "action=evidence",
             "task=SLC-001-T001", "check=unit.main",
             "result=pass", "path=does/not/exist.py",
@@ -1052,6 +1136,10 @@ class TestPrdOrchestrateActionGuardrails:
 
 
 class TestPrdOrchestrateImplementationInvariant:
+    """Implementation may change freely while a task is IN_PROGRESS;
+    each pass-evidence entry binds the tree it proves, and completion
+    requires a current-tree pass for every declared check kind."""
+
     @pytest.fixture(autouse=True)
     def project(self, tmp_path, monkeypatch):
         for k in [k for k in os.environ if k.startswith("SPECIFY_")]:
@@ -1063,15 +1151,91 @@ class TestPrdOrchestrateImplementationInvariant:
         _author_workspace(tmp_path)
         _run_orchestrate(self.env, "slug=demo", "action=initialize")
 
-    def test_orchestrator_refuses_after_implementation_change(self):
+    def _read_ledger(self):
+        return yaml.safe_load(
+            (self.tmp / ".specify/specs/demo/000-spec-of-specs/orchestration.yml").read_text(
+                encoding="utf-8"
+            )
+        )
+
+    def _declare_checks(self):
+        commands = {
+            "unit": ["pytest tests/unit/test_x.py"],
+            "regression": ["pytest tests/regression/test_x.py"],
+            "e2e": ["bash scripts/e2e/x.sh"],
+        }
+        ledger = self._read_ledger()
+        ledger["slices"][0]["tasks"][0]["checks"] = {
+            k: list(commands.get(k, []))
+            for k in (
+                "unit", "integration", "regression", "e2e",
+                "migration", "deployment", "rollback",
+            )
+        }
+        (self.tmp / ".specify/specs/demo/000-spec-of-specs/orchestration.yml").write_text(
+            yaml.safe_dump(ledger), encoding="utf-8"
+        )
+
+    def _start(self):
         r = _run_orchestrate(
             self.env, "slug=demo", "action=start",
             "task=SLC-001-T001", "owner=alice",
         )
-        assert r.returncode == 0
-        new_dir = self.tmp / "src" / "feature"
-        new_dir.mkdir(parents=True)
-        (new_dir / "main.py").write_text("# new\n", encoding="utf-8")
+        assert r.returncode == 0, r.stderr
+
+    def _record_pass_evidence(self, kinds=("unit", "regression", "e2e")):
+        for kind in kinds:
+            r = _run_orchestrate(
+                self.env, "slug=demo", "action=evidence",
+                "task=SLC-001-T001", f"check={kind}.main",
+                "result=pass", "path=README.md",
+            )
+            assert r.returncode == 0, r.stdout
+
+    def _add_implementation_file(self, name="main.py"):
+        src = self.tmp / "src" / "feature"
+        src.mkdir(parents=True)
+        (src / name).write_text("# new\n", encoding="utf-8")
+
+    def test_normal_start_implement_evidence_complete_succeeds(self):
+        self._declare_checks()
+        self._start()
+        self._add_implementation_file()
+        self._record_pass_evidence()
+        r = _run_orchestrate(
+            self.env, "slug=demo", "action=complete",
+            "task=SLC-001-T001",
+        )
+        assert r.returncode == 0, r.stdout
+        body = json.loads(r.stdout)
+        assert body["slice_done"] is True
+        assert body["project_state"] == "AWAITING_APPROVAL"
+
+    def test_pass_evidence_binds_current_implementation_fingerprint(self):
+        self._declare_checks()
+        self._start()
+        self._add_implementation_file()
+        self._record_pass_evidence()
+        ledger = self._read_ledger()
+        reference = ledger["repository"]["implementation_fingerprint"]
+        task = ledger["slices"][0]["tasks"][0]
+        assert task["state"] == "IN_PROGRESS"
+        entries = task["evidence"]
+        assert {e["check_kind"] for e in entries} == {"unit", "regression", "e2e"}
+        for entry in entries:
+            assert entry["implementation_fingerprint"] == reference
+
+    def test_recording_evidence_does_not_poison_completion(self):
+        self._declare_checks()
+        self._start()
+        self._record_pass_evidence()
+        r = _run_orchestrate(
+            self.env, "slug=demo", "action=complete",
+            "task=SLC-001-T001",
+        )
+        assert r.returncode == 0, r.stdout
+
+    def test_evidence_rejects_task_not_in_progress(self):
         r = _run_orchestrate(
             self.env, "slug=demo", "action=evidence",
             "task=SLC-001-T001", "check=unit.main",
@@ -1079,8 +1243,290 @@ class TestPrdOrchestrateImplementationInvariant:
         )
         assert r.returncode == 1
         body = json.loads(r.stdout)
-        assert body["reason"] == "implementation_hash_changed"
-        assert "Halt" in body["recovery"]
+        assert body["reason"] == "task_not_in_progress"
+
+    def test_evidence_rejects_second_task_while_another_is_active(self):
+        self._start()
+        ledger = self._read_ledger()
+        ledger["slices"][0]["tasks"].append({
+            "id": "SLC-001-T002",
+            "rank": 2,
+            "state": "TODO",
+            "requirements": [],
+            "acceptance": [],
+            "interfaces": [],
+            "documentation_evidence": [],
+            "checks": {
+                "unit": [], "integration": [], "regression": [],
+                "e2e": [], "migration": [], "deployment": [], "rollback": [],
+            },
+            "evidence": [],
+            "blockers": [],
+        })
+        (self.tmp / ".specify/specs/demo/000-spec-of-specs/orchestration.yml").write_text(
+            yaml.safe_dump(ledger), encoding="utf-8"
+        )
+        r = _run_orchestrate(
+            self.env, "slug=demo", "action=evidence",
+            "task=SLC-001-T002", "check=unit.main",
+            "result=pass", "path=README.md",
+        )
+        assert r.returncode == 1
+        body = json.loads(r.stdout)
+        assert body["reason"] == "task_not_in_progress"
+
+    @pytest.mark.parametrize("mutation", ["add", "change", "delete"])
+    def test_post_evidence_source_change_blocks_completion_until_rerecorded(self, mutation):
+        self._declare_checks()
+        self._start()
+        self._add_implementation_file()
+        self._record_pass_evidence()
+        target = self.tmp / "src" / "feature" / "main.py"
+        if mutation == "add":
+            (self.tmp / "src" / "feature" / "extra.py").write_text(
+                "# extra\n", encoding="utf-8"
+            )
+        elif mutation == "change":
+            with target.open("a", encoding="utf-8") as fh:
+                fh.write("# changed\n")
+        elif mutation == "delete":
+            target.unlink()
+        r = _run_orchestrate(
+            self.env, "slug=demo", "action=complete",
+            "task=SLC-001-T001",
+        )
+        assert r.returncode == 1
+        body = json.loads(r.stdout)
+        assert body["reason"] == "evidence_stale"
+        assert set(body["stale"]) == {"unit", "regression", "e2e"}
+        self._record_pass_evidence()
+        r = _run_orchestrate(
+            self.env, "slug=demo", "action=complete",
+            "task=SLC-001-T001",
+        )
+        assert r.returncode == 0, r.stdout
+
+    def test_complete_without_evidence_still_blocked(self):
+        self._declare_checks()
+        self._start()
+        r = _run_orchestrate(
+            self.env, "slug=demo", "action=complete",
+            "task=SLC-001-T001",
+        )
+        assert r.returncode == 1
+        body = json.loads(r.stdout)
+        assert body["reason"] == "missing_evidence"
+
+    def test_partial_evidence_still_blocked(self):
+        self._declare_checks()
+        self._start()
+        self._record_pass_evidence(kinds=("unit",))
+        r = _run_orchestrate(
+            self.env, "slug=demo", "action=complete",
+            "task=SLC-001-T001",
+        )
+        assert r.returncode == 1
+        body = json.loads(r.stdout)
+        assert body["reason"] == "missing_evidence"
+        missing = [k for k, _ in body["missing"]]
+        assert set(missing) == {"regression", "e2e"}
+
+    def test_reopen_after_drift_clears_evidence_and_refreshes_reference(self):
+        self._declare_checks()
+        self._start()
+        self._add_implementation_file()
+        self._record_pass_evidence()
+        stale_reference = self._read_ledger()["repository"]["implementation_fingerprint"]
+        target = self.tmp / "src" / "feature" / "main.py"
+        with target.open("a", encoding="utf-8") as fh:
+            fh.write("# invalidated\n")
+        r = _run_orchestrate(
+            self.env, "slug=demo", "action=reopen",
+            "task=SLC-001-T001", "reason=implementation drifted",
+        )
+        assert r.returncode == 0, r.stdout
+        ledger = self._read_ledger()
+        task = ledger["slices"][0]["tasks"][0]
+        assert task["state"] == "STALE"
+        assert task["evidence"] == []
+        refreshed = ledger["repository"]["implementation_fingerprint"]
+        assert refreshed != stale_reference
+        r = _run_orchestrate(
+            self.env, "slug=demo", "action=start",
+            "task=SLC-001-T001", "owner=alice",
+        )
+        assert r.returncode == 0, r.stdout
+        r = _run_orchestrate(
+            self.env, "slug=demo", "action=complete",
+            "task=SLC-001-T001",
+        )
+        assert r.returncode == 1
+        body = json.loads(r.stdout)
+        assert body["reason"] == "missing_evidence"
+        self._record_pass_evidence()
+        r = _run_orchestrate(
+            self.env, "slug=demo", "action=complete",
+            "task=SLC-001-T001",
+        )
+        assert r.returncode == 0, r.stdout
+
+    def _write_ledger(self, ledger):
+        (self.tmp / ".specify/specs/demo/000-spec-of-specs/orchestration.yml").write_text(
+            yaml.safe_dump(ledger), encoding="utf-8"
+        )
+
+    def _make_task(self, task_id, rank, state, *, deps=(), owner=None, checks=(), evidence=()):
+        return {
+            "id": task_id,
+            "rank": rank,
+            "state": state,
+            "requirements": [],
+            "acceptance": [],
+            "interfaces": [],
+            "documentation_evidence": [],
+            "checks": {
+                "unit": ["pytest tests/unit/test_x.py"] if "unit" in checks else [],
+                "integration": [],
+                "regression": ["pytest tests/regression/test_x.py"] if "regression" in checks else [],
+                "e2e": ["bash scripts/e2e/x.sh"] if "e2e" in checks else [],
+                "migration": [],
+                "deployment": [],
+                "rollback": [],
+            },
+            "evidence": list(evidence),
+            "blockers": [],
+            "dependencies": list(deps),
+            "active_owner": owner,
+        }
+
+    def test_reopen_without_dependencies_invalidates_later_materialized_tasks(self):
+        """Wawi-shaped chain (no task dependencies): reopening a completed
+        task stales later materialized tasks, clears their evidence and
+        owners, and leaves earlier and unstarted work untouched."""
+        self._start()
+        ledger = self._read_ledger()
+        slice_meta = ledger["slices"][0]
+        t0, t1, t2, t3, t4, t5, t6 = (
+            "SLC-001-T000",
+            "SLC-001-T001",
+            "SLC-001-T002",
+            "SLC-001-T003",
+            "SLC-001-T004",
+            "SLC-001-T005",
+            "SLC-001-T006",
+        )
+        proof = [{"check_kind": "unit", "check_id": "main", "result": "pass"}]
+        slice_meta["state"] = "IN_PROGRESS"
+        slice_meta["tasks"] = [
+            self._make_task(t0, 0, "DONE", evidence=proof),
+            self._make_task(t1, 1, "DONE", owner="alice", checks=("unit",), evidence=proof),
+            self._make_task(t2, 2, "IN_PROGRESS", owner="bob", evidence=proof),
+            self._make_task(t3, 3, "DONE", owner="carol", evidence=proof),
+            self._make_task(t4, 4, "BLOCKED", owner="dana", evidence=proof),
+            self._make_task(t5, 5, "READY"),
+            self._make_task(t6, 6, "TODO"),
+        ]
+        slice_meta["tasks"][1]["completed_at"] = "2026-08-10T14:19:47Z"
+        slice_meta["tasks"][3]["completed_at"] = "2026-08-10T14:20:00Z"
+        ledger["priorities"]["execution"] = [
+            f"SLC-001::{t0}", f"SLC-001::{t1}", f"SLC-001::{t2}",
+            f"SLC-001::{t3}", f"SLC-001::{t4}", f"SLC-001::{t5}",
+            f"SLC-001::{t6}",
+        ]
+        ledger["project"].update({"current_task": t2, "active_owner": "bob"})
+        stale_reference = ledger.get("repository", {}).get("implementation_fingerprint")
+        assert stale_reference
+        self._write_ledger(ledger)
+        self._add_implementation_file()
+
+        r = _run_orchestrate(
+            self.env, "slug=demo", "action=reopen",
+            "task=SLC-001-T001", "reason=implementation drifted",
+        )
+        assert r.returncode == 0, r.stdout
+        body = json.loads(r.stdout)
+        assert set(body["invalidated"]) == {
+            "SLC-001-T001",
+            "SLC-001-T002",
+            "SLC-001-T003",
+            "SLC-001-T004",
+        }
+
+        ledger = self._read_ledger()
+        tasks = {t["id"]: t for t in ledger["slices"][0]["tasks"]}
+        assert tasks[t0]["state"] == "DONE"  # earlier materialized task untouched
+        assert tasks[t1]["state"] == "STALE"  # reopened target
+        assert tasks[t1]["evidence"] == []
+        assert tasks[t1]["active_owner"] is None
+        assert tasks[t1].get("completed_at") is None
+        assert tasks[t2]["state"] == "STALE"  # later materialized task invalidated
+        assert tasks[t2]["evidence"] == []
+        assert tasks[t2]["active_owner"] is None
+        assert tasks[t3]["state"] == "STALE"  # later completed task invalidated
+        assert tasks[t3]["evidence"] == []
+        assert tasks[t3]["active_owner"] is None
+        assert tasks[t3].get("completed_at") is None
+        assert tasks[t4]["state"] == "STALE"  # later blocked task invalidated
+        assert tasks[t4]["evidence"] == []
+        assert tasks[t4]["active_owner"] is None
+        assert tasks[t5]["state"] == "READY"  # unstarted task stays planned
+        assert tasks[t6]["state"] == "TODO"  # later todo task stays planned
+        assert ledger["project"]["current_task"] is None
+        assert ledger["project"]["active_owner"] is None
+        assert ledger["repository"]["implementation_fingerprint"] != stale_reference
+        assert not any(
+            t["state"] == "IN_PROGRESS"
+            for t in ledger["slices"][0]["tasks"]
+        )
+
+        # Next eligible task is the reopened T001.
+        r = _run_orchestrate(self.env, "slug=demo", "action=next")
+        assert r.returncode == 0, r.stdout
+        assert json.loads(r.stdout)["task"]["id"] == "SLC-001-T001"
+
+        # Fresh evidence is still mandatory before completion.
+        r = _run_orchestrate(
+            self.env, "slug=demo", "action=start",
+            "task=SLC-001-T001", "owner=alice",
+        )
+        assert r.returncode == 0, r.stdout
+        r = _run_orchestrate(
+            self.env, "slug=demo", "action=complete",
+            "task=SLC-001-T001",
+        )
+        assert r.returncode == 1
+        assert json.loads(r.stdout)["reason"] == "missing_evidence"
+
+    def test_reopen_preserves_explicit_transitive_dependency_invalidation(self):
+        """Explicit task dependencies still invalidate transitively."""
+        ledger = self._read_ledger()
+        slice_meta = ledger["slices"][0]
+        t1, t2, t3 = ("SLC-001-T001", "SLC-001-T002", "SLC-001-T003")
+        proof = [{"check_kind": "unit", "check_id": "main", "result": "pass"}]
+        slice_meta["tasks"] = [
+            self._make_task(t1, 1, "DONE", owner="alice", checks=("unit",), evidence=proof),
+            self._make_task(t2, 2, "DONE", deps=(t1,), owner="bob", evidence=proof),
+            self._make_task(t3, 3, "DONE", deps=(t2,), evidence=proof),
+        ]
+        ledger["priorities"]["execution"] = [
+            f"SLC-001::{t1}", f"SLC-001::{t2}", f"SLC-001::{t3}",
+        ]
+        ledger["project"]["current_task"] = None
+        self._write_ledger(ledger)
+
+        r = _run_orchestrate(
+            self.env, "slug=demo", "action=reopen",
+            "task=SLC-001-T001", "reason=implementation drifted",
+        )
+        assert r.returncode == 0, r.stdout
+        ledger = self._read_ledger()
+        tasks = {t["id"]: t for t in ledger["slices"][0]["tasks"]}
+        for tid in (t1, t2, t3):
+            assert tasks[tid]["state"] == "STALE"
+            assert tasks[tid]["evidence"] == []
+            assert tasks[tid]["active_owner"] is None
+        assert ledger["project"]["current_task"] is None
+        assert ledger["project"]["active_owner"] is None
 
 
 # ── Python twin: orchestration-phase validation ────────────────────
@@ -1110,6 +1556,23 @@ class TestPrdValidateOrchestrationPhase:
         assert body["phase"] == "orchestration"
         names = {f["name"] for f in body["failures"]}
         assert any("no_checks" in n for n in names)
+
+    def test_canonical_root_source_does_not_require_a_derived_normalization(self):
+        manifest_path = self.tmp / ".specify/specs/demo/000-spec-of-specs/manifest.yml"
+        manifest = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
+        root_prd = self.tmp / "prd.md"
+        manifest["source"].update(
+            {
+                "canonical_path": "prd.md",
+                "preserved_at": "prd.md",
+                "sha256": hashlib.sha256(root_prd.read_bytes()).hexdigest(),
+            }
+        )
+        manifest_path.write_text(yaml.safe_dump(manifest, sort_keys=False), encoding="utf-8")
+
+        r = self._validate("slug=demo", "phase=orchestration")
+        body = json.loads(r.stdout)
+        assert "source.normalized" not in {failure["name"] for failure in body["failures"]}
 
     def test_phase_all_includes_orchestration_when_ledger_present(self):
         r = self._validate("slug=demo", "phase=all")

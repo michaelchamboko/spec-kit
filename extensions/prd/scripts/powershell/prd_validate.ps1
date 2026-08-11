@@ -53,9 +53,9 @@ function Get-ManifestValue {
         [string]$ManifestPath,
         [string]$Key
     )
-    $line = Select-String -LiteralPath $ManifestPath -Pattern "^${Key}:" -ErrorAction SilentlyContinue | Select-Object -First 1
+    $line = Select-String -LiteralPath $ManifestPath -Pattern "^\s*${Key}:" -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($null -eq $line) { return $null }
-    $value = ($line.Line -replace "^${Key}:\s*", '').Trim().Trim('"')
+    $value = ($line.Line -replace "^\s*${Key}:\s*", '').Trim().Trim('"')
     return $value
 }
 
@@ -78,6 +78,7 @@ function Test-SourceIntegrity {
         [string]$ProjectRoot,
         [string]$ManifestPath
     )
+    $canonicalRel = Get-ManifestValue -ManifestPath $ManifestPath -Key 'canonical_path'
     $preservedRel = Get-ManifestValue -ManifestPath $ManifestPath -Key 'preserved_at'
     if ([string]::IsNullOrEmpty($preservedRel)) {
         Add-ValidationResult -Name 'source.preserved' -Pass $false -Detail 'missing preserved file'
@@ -95,6 +96,9 @@ function Test-SourceIntegrity {
         Add-ValidationResult -Name 'source.sha256' -Pass $false -Detail "expected=$expected got=$actual"
     } else {
         Add-ValidationResult -Name 'source.sha256' -Pass $true
+    }
+    if (-not [string]::IsNullOrEmpty($canonicalRel) -and $canonicalRel -eq $preservedRel) {
+        return
     }
     $normalized = ($preservedRel -replace '\.[^.]+$', '') + '.normalized.md'
     $normalizedFull = Join-Path $ProjectRoot $normalized
