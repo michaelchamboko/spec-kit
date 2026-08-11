@@ -16,7 +16,9 @@ Validates:
 from __future__ import annotations
 
 import json
+import hashlib
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -27,6 +29,12 @@ import yaml
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 EXT_DIR = PROJECT_ROOT / "extensions" / "prd"
+
+
+def _normalize_state_owned_values(text: str) -> str:
+    text = re.sub(r"^  implementation_fingerprint: .*$\n", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^\s+active_owner: .*$\n", "", text, flags=re.MULTILINE)
+    return re.sub(r"^updated_at: .*$", "updated_at: <state-owned>", text, flags=re.MULTILINE)
 
 EXPECTED_COMMANDS = {
     "speckit.prd.plan",
@@ -922,6 +930,77 @@ class TestPrdOrchestrateActionGuardrails:
         assert body["task"] is not None
         assert body["task"]["id"] == "SLC-001-T001"
 
+    def test_start_preserves_hand_authored_ledger_text(self):
+        ledger_path = self.tmp / ".specify/specs/demo/000-spec-of-specs/orchestration.yml"
+        before = ledger_path.read_text(encoding="utf-8")
+        before = "# operator-maintained ledger\n" + before.replace(
+            "project:\n", "project:\n  # retain this comment\n", 1
+        )
+        ledger_path.write_text(before, encoding="utf-8")
+
+        r = _run_orchestrate(
+            self.env, "slug=demo", "action=start",
+            "task=SLC-001-T001", "owner=alice",
+        )
+        assert r.returncode == 0, r.stderr
+
+        expected = before.replace("revision: 1\n", "revision: 2\n", 1)
+        expected = expected.replace("state: NOT_STARTED", "state: IN_PROGRESS", 1)
+        expected = expected.replace("current_task: null", "current_task: SLC-001-T001", 1)
+        expected = expected.replace("current_task:\n", "current_task: SLC-001-T001\n", 1)
+        expected = expected.replace("active_owner: null", "active_owner: alice")
+        expected = expected.replace("active_owner:\n", "active_owner: alice\n")
+        expected = expected.replace("state: TODO", "state: IN_PROGRESS", 1)
+        expected = expected.replace(
+            "      blockers: []\n", "      blockers: []\n      active_owner: alice\n", 1
+        )
+        assert _normalize_state_owned_values(ledger_path.read_text(encoding="utf-8")) == (
+            _normalize_state_owned_values(expected)
+        )
+
+    def test_block_preserves_hand_authored_ledger_text(self):
+        ledger_path = self.tmp / ".specify/specs/demo/000-spec-of-specs/orchestration.yml"
+        before = "# operator-maintained ledger\n" + ledger_path.read_text(encoding="utf-8")
+        ledger_path.write_text(before, encoding="utf-8")
+
+        r = _run_orchestrate(
+            self.env, "slug=demo", "action=block",
+            "task=SLC-001-T001", "reason=validator mismatch",
+        )
+        assert r.returncode == 0, r.stderr
+
+        after = ledger_path.read_text(encoding="utf-8")
+        assert after.split("repository:", 1)[0] == before.replace(
+            "revision: 1\n", "revision: 2\n", 1
+        ).split("repository:", 1)[0]
+        assert "# operator-maintained ledger" in after
+        assert "reason: validator mismatch" in after
+
+    @pytest.mark.skipif(
+        not (shutil.which("pwsh") or shutil.which("powershell.exe") or shutil.which("powershell")),
+        reason="pwsh/PowerShell not available",
+    )
+    def test_powershell_orchestrator_dispatches_to_python_twin(self):
+        pwsh = shutil.which("pwsh") or shutil.which("powershell.exe") or shutil.which("powershell")
+        r = subprocess.run(
+            [
+                pwsh,
+                "-NoProfile",
+                "-File",
+                str(EXT_DIR / "scripts" / "powershell" / "prd_orchestrate.ps1"),
+                "-Slug",
+                "demo",
+                "-Action",
+                "status",
+            ],
+            capture_output=True,
+            text=True,
+            env={**self.env, "SPECKIT_PYTHON": sys.executable},
+            timeout=30,
+        )
+        assert r.returncode == 0, r.stderr
+        assert json.loads(r.stdout)["action"] == "status"
+
     def test_start_then_start_another_rejected(self):
         r = _run_orchestrate(
             self.env, "slug=demo", "action=start",
@@ -1110,6 +1189,23 @@ class TestPrdValidateOrchestrationPhase:
         assert body["phase"] == "orchestration"
         names = {f["name"] for f in body["failures"]}
         assert any("no_checks" in n for n in names)
+
+    def test_canonical_root_source_does_not_require_a_derived_normalization(self):
+        manifest_path = self.tmp / ".specify/specs/demo/000-spec-of-specs/manifest.yml"
+        manifest = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
+        root_prd = self.tmp / "prd.md"
+        manifest["source"].update(
+            {
+                "canonical_path": "prd.md",
+                "preserved_at": "prd.md",
+                "sha256": hashlib.sha256(root_prd.read_bytes()).hexdigest(),
+            }
+        )
+        manifest_path.write_text(yaml.safe_dump(manifest, sort_keys=False), encoding="utf-8")
+
+        r = self._validate("slug=demo", "phase=orchestration")
+        body = json.loads(r.stdout)
+        assert "source.normalized" not in {failure["name"] for failure in body["failures"]}
 
     def test_phase_all_includes_orchestration_when_ledger_present(self):
         r = self._validate("slug=demo", "phase=all")

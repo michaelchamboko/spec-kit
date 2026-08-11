@@ -6,7 +6,8 @@ traceability, graph-freshness, orchestration-ledger, evidence,
 regression, and readiness checks the command spec describes:
 
 - Manifest schema, state consistency, required fields
-- Source integrity (normalized markdown present, SHA-256 matches manifest)
+- Source integrity (preserved PRD SHA-256 matches manifest; a normalized
+  derivative is required unless the preserved PRD is the declared canonical source)
 - Requirements traceability (every requirement has a stable ID and source)
 - Slice decomposition (stable IDs, acyclic dependencies, frozen order)
 - Codegraph evidence (provider/version, indexed state, exclusions)
@@ -102,6 +103,10 @@ def _validate_source_integrity(
                 f"expected {expected_digest}, got {actual_digest}",
             )
         )
+
+    canonical_rel = str(source_meta.get("canonical_path", ""))
+    if canonical_rel and canonical_rel == preserved_rel:
+        return failures
 
     normalized_rel = preserved_rel.rsplit(".", 1)[0] + ".normalized.md"
     normalized_path = project_root / normalized_rel

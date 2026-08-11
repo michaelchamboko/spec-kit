@@ -215,7 +215,10 @@ For every dependency used by the slice:
   outside `.specify/`.
 - **Source preservation.** The original PRD bytes are preserved at
   `source/prd-v<version>.<ext>` with a SHA-256 digest recorded in
-  `manifest.yml`. The normalized form is the only derivative.
+  `manifest.yml`. A normalized Markdown derivative is required for generated
+  workspaces; projects may instead declare the preserved root PRD as the
+  canonical source by setting identical `source.canonical_path` and
+  `source.preserved_at` values. That explicit form creates no derivative.
 - **Orchestration ledger as sole source of truth.**
   `orchestration.yml` (schema `1.1`) is the only machine-readable
   record of waterfall state. Every state-changing action reads,

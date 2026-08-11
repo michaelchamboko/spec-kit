@@ -88,5 +88,6 @@ foreach ($pair in @(
     }
 }
 
-& $python (Join-Path $ScriptDir 'prd_orchestrate.py') @argsForPython
+$pythonScript = Join-Path (Join-Path (Split-Path -Parent $ScriptDir) 'python') 'prd_orchestrate.py'
+& $python $pythonScript @argsForPython
 exit $LASTEXITCODE

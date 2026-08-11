@@ -23,8 +23,11 @@ import re
 import sys
 import tempfile
 import time as _time
+from io import StringIO
 from pathlib import Path
 from typing import Any
+
+from ruamel.yaml import YAML
 
 
 SLUG_RE = re.compile(r"[^a-z0-9-]+")
@@ -505,11 +508,13 @@ def ledger_exists(artifact_dir: Path, project_root: Path) -> bool:
 
 
 def load_ledger(artifact_dir: Path, project_root: Path) -> dict[str, Any] | None:
-    """Load ``orchestration.yml``; return ``None`` when absent."""
+    """Load ``orchestration.yml`` with its comments and layout intact."""
     path = ledger_path(artifact_dir, project_root)
     if not path.is_file():
         return None
-    return yaml_safe_load(path.read_text(encoding="utf-8"))
+    parser = YAML(typ="rt")
+    parser.preserve_quotes = True
+    return parser.load(path.read_text(encoding="utf-8"))
 
 
 def write_ledger(
@@ -517,9 +522,14 @@ def write_ledger(
     project_root: Path,
     payload: dict[str, Any],
 ) -> Path:
-    """Persist the orchestration ledger atomically."""
+    """Persist only state changes without rewriting hand-authored YAML layout."""
     path = ledger_path(artifact_dir, project_root)
-    body = yaml_safe_dump(payload)
+    parser = YAML(typ="rt")
+    parser.preserve_quotes = True
+    parser.width = 4096
+    stream = StringIO()
+    parser.dump(payload, stream)
+    body = stream.getvalue()
     atomic_write_text(path, body)
     return path
 

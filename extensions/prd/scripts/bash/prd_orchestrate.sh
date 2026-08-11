@@ -36,4 +36,4 @@ if [[ $# -eq 0 ]]; then
     exit 2
 fi
 
-exec "$PYTHON_BIN" "$SCRIPT_DIR/prd_orchestrate.py" "$@"
+exec "$PYTHON_BIN" "$SCRIPT_DIR/../python/prd_orchestrate.py" "$@"

@@ -46,7 +46,8 @@ check_manifest_fields() {
 check_source_integrity() {
     local manifest_path="$1"
     local project_root="$2"
-    local preserved_rel byte_size expected_digest
+    local canonical_rel preserved_rel byte_size expected_digest
+    canonical_rel=$(grep '^[[:space:]]*canonical_path:' "$manifest_path" | sed -E 's/^[[:space:]]*canonical_path:[[:space:]]*//; s/^"//; s/"$//')
     preserved_rel=$(grep '^[[:space:]]*preserved_at:' "$manifest_path" | sed -E 's/^[[:space:]]*preserved_at:[[:space:]]*//; s/^"//; s/"$//')
     if [[ -z "$preserved_rel" ]] || [[ ! -f "$project_root/$preserved_rel" ]]; then
         record_check "source.preserved" "FAIL" "missing preserved file"
@@ -60,6 +61,9 @@ check_source_integrity() {
         record_check "source.sha256" "FAIL" "expected=$expected_digest got=$actual_digest"
     else
         record_check "source.sha256" "PASS" "digest matches"
+    fi
+    if [[ -n "$canonical_rel" && "$canonical_rel" == "$preserved_rel" ]]; then
+        return 0
     fi
     local normalized_rel
     normalized_rel="${preserved_rel%.*}.normalized.md"
